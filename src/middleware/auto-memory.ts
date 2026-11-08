@@ -39,14 +39,13 @@ const DEFAULT_CONFIG: AutoMemoryConfig = {
 
 export class AutoMemoryMiddleware {
   private config: AutoMemoryConfig;
-  private readonly anthropic: Anthropic;
+  private anthropic: Anthropic | null = null;
   private readonly sessionEntries = new Map<string, number>();
   private readonly dedup: DedupStore;
   private purgeTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(config: Partial<AutoMemoryConfig> = {}, dedup?: DedupStore) {
     this.config = { ...DEFAULT_CONFIG, ...config };
-    this.anthropic = new Anthropic();
     this.dedup = dedup ?? createDedupStore();
 
     this.purgeTimer = setInterval(() => {
@@ -59,6 +58,19 @@ export class AutoMemoryMiddleware {
     if (typeof this.purgeTimer === 'object' && 'unref' in this.purgeTimer) {
       this.purgeTimer.unref();
     }
+  }
+
+  private getAnthropic(): Anthropic {
+    if (!this.anthropic) {
+      if (!process.env.ANTHROPIC_API_KEY) {
+        throw new AppError(
+          'ANALYSIS_FAILED',
+          'ANTHROPIC_API_KEY is not set; cannot run Auto-Memory analysis'
+        );
+      }
+      this.anthropic = new Anthropic();
+    }
+    return this.anthropic;
   }
 
   async processInteraction(
@@ -85,6 +97,7 @@ export class AutoMemoryMiddleware {
     try {
       analysis = await this.analyzeImportance(request, response);
     } catch (error) {
+      if (error instanceof AppError) throw error;
       throw new AppError(
         'ANALYSIS_FAILED',
         error instanceof Error ? error.message : 'Analysis failed'
@@ -120,31 +133,9 @@ export class AutoMemoryMiddleware {
   }
 
   private async analyzeImportance(request: string, response: string): Promise<AnalysisResult> {
-    const prompt = `Analysiere diese AI-Interaktion und bestimme ob sie für langfristiges Wissen gespeichert werden sollte.
+    const prompt = `Analysiere diese AI-Interaktion und bestimme ob sie fuer langfristiges Wissen gespeichert werden sollte.\n\nREQUEST:\n${request.substring(0, 2000)}\n\nRESPONSE:\n${response.substring(0, 3000)}\n\nAntworte NUR mit validem JSON in diesem Format:\n{\n  "isImportant": boolean,\n  "type": "decision" | "fix" | "learning" | "pattern" | "preference" | "config" | "error" | "context" | "conversation",\n  "summary": "Kurze Zusammenfassung (max 200 Zeichen)",\n  "tags": ["tag1", "tag2", "tag3"],\n  "confidence": 0.0-1.0,\n  "context": "Optional: Warum ist das wichtig?"\n}\n\nRegeln:\n- isImportant=true NUR wenn: Entscheidung, Bug-Fix, Learning, Pattern, Preference, Config\n- isImportant=false fuer Smalltalk und einfache Fragen\n- confidence: 0.9+ sehr wichtig, 0.7-0.9 wichtig, <0.7 nicht speichern\n- tags: max 5, lowercase`;
 
-REQUEST:
-${request.substring(0, 2000)}
-
-RESPONSE:
-${response.substring(0, 3000)}
-
-Antworte NUR mit validem JSON in diesem Format:
-{
-  "isImportant": boolean,
-  "type": "decision" | "fix" | "learning" | "pattern" | "preference" | "config" | "error" | "context" | "conversation",
-  "summary": "Kurze Zusammenfassung (max 200 Zeichen)",
-  "tags": ["tag1", "tag2", "tag3"],
-  "confidence": 0.0-1.0,
-  "context": "Optional: Warum ist das wichtig?"
-}
-
-Regeln:
-- isImportant=true NUR wenn: Entscheidung getroffen, Bug gelöst, etwas Neues gelernt, Pattern etabliert, Preference/Config festgehalten
-- isImportant=false für: Smalltalk, einfache Fragen, Code-Generierung ohne Erklärung, Wiederholungen
-- confidence: 0.9+ = sehr wichtig, 0.7-0.9 = wichtig, <0.7 = nicht speichern
-- tags: max 5, lowercase, relevant für Suche`;
-
-    const message = await this.anthropic.messages.create({
+    const message = await this.getAnthropic().messages.create({
       model: this.config.analysisModel,
       max_tokens: 500,
       messages: [{ role: 'user', content: prompt }],
