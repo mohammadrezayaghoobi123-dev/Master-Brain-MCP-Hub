@@ -1,7 +1,10 @@
 // Persistent content-hash store for auto-memory deduplication.
 // Uses better-sqlite3 when available; falls back to in-process Map.
+import { createRequire } from 'node:module';
 import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+
+const require = createRequire(import.meta.url);
 
 export interface DedupStore {
   has(hash: string): boolean;
