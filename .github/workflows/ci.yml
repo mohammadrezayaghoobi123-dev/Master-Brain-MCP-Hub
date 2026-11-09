@@ -30,23 +30,8 @@ jobs:
           node-version: "22"
           package-manager-cache: false
 
-      # Generate the lockfile with the same Node/npm toolchain used by CI.
-      # Scripts are disabled because this step resolves metadata only.
-      - name: Generate package lockfile
-        run: npm install --package-lock-only --ignore-scripts --no-audit --no-fund
-
-      - name: Upload package lockfile for review
-        uses: actions/upload-artifact@v4.6.2
-        with:
-          name: package-lock-bootstrap
-          path: package-lock.json
-          if-no-files-found: error
-          retention-days: 1
-
-      # package-lock.json is currently absent; npm install is temporary until
-      # a reviewed lockfile is committed. No production secrets are required.
       - name: Install dependencies
-        run: npm install --no-audit --no-fund
+        run: npm ci --no-audit --no-fund
 
       - name: Type check
         run: npm run typecheck
@@ -74,7 +59,7 @@ jobs:
           package-manager-cache: false
 
       - name: Install dependencies
-        run: npm install --no-audit --no-fund
+        run: npm ci --no-audit --no-fund
 
       - name: Audit dependency advisories
         run: npm audit --audit-level=moderate
