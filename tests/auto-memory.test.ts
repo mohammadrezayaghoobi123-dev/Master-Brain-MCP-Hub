@@ -70,3 +70,62 @@ describe('content hash integration (dedup)', () => {
     mw.close();
   });
 });
+
+
+describe('AutoMemoryMiddleware concurrent deduplication', () => {
+  it('allows only one concurrent save for the same request/response pair', async () => {
+    const dedup = memoryDedup();
+    const mw = new AutoMemoryMiddleware({ enabled: true, minConfidence: 0.5 }, dedup);
+    const analysis = {
+      isImportant: true,
+      type: 'decision' as const,
+      summary: 'A durable decision',
+      tags: ['decision'],
+      confidence: 0.99,
+    };
+
+    let releaseAnalysis!: () => void;
+    const analysisGate = new Promise<void>((resolve) => {
+      releaseAnalysis = resolve;
+    });
+    const analyze = vi.spyOn(mw as any, 'analyzeImportance').mockImplementation(async () => {
+      await analysisGate;
+      return analysis;
+    });
+
+    _resetBrainClientForTests();
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 201,
+      json: async () => ({
+        id: 'entry-1',
+        type: 'decision',
+        content: 'A durable decision',
+        tags: ['decision'],
+        timestamp: new Date().toISOString(),
+        source: { tool: 'manual' },
+      }),
+    }) as unknown as typeof fetch;
+
+    const first = mw.processInteraction('same request', 'same response', {
+      tool: 'manual',
+      session_id: 'concurrent-session',
+    });
+    const second = mw.processInteraction('same request', 'same response', {
+      tool: 'manual',
+      session_id: 'concurrent-session',
+    });
+
+    await Promise.resolve();
+    releaseAnalysis();
+    const results = await Promise.all([first, second]);
+
+    expect(analyze).toHaveBeenCalledTimes(1);
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+    expect(results.filter((result) => result.saved)).toHaveLength(1);
+    expect(results.filter((result) => result.reason === 'duplicate')).toHaveLength(1);
+
+    mw.close();
+    _resetBrainClientForTests();
+  });
+});
