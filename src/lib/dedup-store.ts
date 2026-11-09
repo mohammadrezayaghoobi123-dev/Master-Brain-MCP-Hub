@@ -8,6 +8,8 @@ const require = createRequire(import.meta.url);
 
 export interface DedupStore {
   has(hash: string): boolean;
+  claim(hash: string, ttlMinutes: number): boolean;
+  release(hash: string): void;
   add(hash: string, ttlMinutes: number): void;
   purgeExpired(): number;
   size(): number;
@@ -25,6 +27,16 @@ class MemoryDedupStore implements DedupStore {
       return false;
     }
     return true;
+  }
+
+  claim(hash: string, ttlMinutes: number): boolean {
+    if (this.has(hash)) return false;
+    this.add(hash, ttlMinutes);
+    return true;
+  }
+
+  release(hash: string): void {
+    this.entries.delete(hash);
   }
 
   add(hash: string, ttlMinutes: number): void {
@@ -87,6 +99,19 @@ class SqliteDedupStore implements DedupStore {
       | { ok: number }
       | undefined;
     return Boolean(row);
+  }
+
+  claim(hash: string, ttlMinutes: number): boolean {
+    this.purgeExpired();
+    const expiresAt = Date.now() + ttlMinutes * 60_000;
+    const result = this.db
+      .prepare('INSERT OR IGNORE INTO content_hashes(hash, expires_at) VALUES(?, ?)')
+      .run(hash, expiresAt);
+    return result.changes === 1;
+  }
+
+  release(hash: string): void {
+    this.db.prepare('DELETE FROM content_hashes WHERE hash = ?').run(hash);
   }
 
   add(hash: string, ttlMinutes: number): void {
