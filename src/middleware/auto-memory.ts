@@ -138,11 +138,16 @@ export class AutoMemoryMiddleware {
         },
       });
 
-      // Start the deduplication window after the durable save succeeds.
-      this.dedup.add(hash, this.config.deduplicationWindowMinutes);
+      // The brain save is durable at this point. Preserve the active claim and
+      // account for the saved entry even if refreshing the dedup TTL fails.
+      persisted = true;
       const currentCount = this.sessionEntries.get(sessionKey) || 0;
       this.sessionEntries.set(sessionKey, currentCount + 1);
-      persisted = true;
+      try {
+        this.dedup.add(hash, this.config.deduplicationWindowMinutes);
+      } catch {
+        // The original claim remains in place until its TTL expires.
+      }
       return { saved: true, entry: analysis };
     } finally {
       const currentReserved = this.sessionReservations.get(sessionKey) || 0;
