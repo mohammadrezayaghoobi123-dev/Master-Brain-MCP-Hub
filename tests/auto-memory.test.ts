@@ -422,3 +422,56 @@ describe('AutoMemoryMiddleware concurrent session limits', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
+
+
+describe('AutoMemoryMiddleware durable-save recovery', () => {
+  it('keeps the active dedup claim when refreshing its TTL fails after save', async () => {
+    const dedup = memoryDedup();
+    const add = vi.spyOn(dedup, 'add').mockImplementation(() => {
+      throw new Error('temporary dedup store failure');
+    });
+    const mw = new AutoMemoryMiddleware(
+      { enabled: true, minConfidence: 0.7, maxEntriesPerSession: 1 },
+      dedup
+    );
+    const analysis = {
+      isImportant: true,
+      type: 'decision' as const,
+      summary: 'Durably saved despite dedup refresh failure',
+      tags: ['recovery'],
+      confidence: 1,
+    };
+    vi.spyOn(mw as any, 'analyzeImportance').mockResolvedValue(analysis);
+    _resetBrainClientForTests();
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 201,
+      json: async () => ({
+        id: 'entry-durable',
+        type: 'decision',
+        content: analysis.summary,
+        tags: analysis.tags,
+        timestamp: new Date().toISOString(),
+        source: { tool: 'manual', session_id: 'durable-save-session' },
+      }),
+    }) as unknown as typeof fetch;
+
+    try {
+      await expect(mw.processInteraction('durable request', 'durable response', {
+        tool: 'manual',
+        session_id: 'durable-save-session',
+      })).resolves.toMatchObject({ saved: true });
+
+      expect(add).toHaveBeenCalledTimes(1);
+      expect(mw.getStatus().sessionCounts['durable-save-session']).toBe(1);
+      await expect(mw.processInteraction('durable request', 'durable response', {
+        tool: 'manual',
+        session_id: 'durable-save-session',
+      })).resolves.toMatchObject({ saved: false, reason: 'duplicate' });
+      expect(global.fetch).toHaveBeenCalledTimes(1);
+    } finally {
+      mw.close();
+      _resetBrainClientForTests();
+    }
+  });
+});
