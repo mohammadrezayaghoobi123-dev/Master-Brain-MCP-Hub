@@ -96,14 +96,14 @@ export class AutoMemoryMiddleware {
     // middleware instance, including across async analysis/save boundaries.
     this.sessionReservations.set(sessionKey, reserved + 1);
     const hash = contentHash(request + '\n---\n' + response);
-    let claimed = false;
+    let reservationToken: number | null = null;
     let persisted = false;
 
     try {
-      if (!this.dedup.claim(hash, this.config.deduplicationWindowMinutes)) {
+      reservationToken = this.dedup.claim(hash, this.config.deduplicationWindowMinutes);
+      if (reservationToken === null) {
         return { saved: false, reason: 'duplicate' };
       }
-      claimed = true;
 
       let analysis: AnalysisResult;
       try {
@@ -149,9 +149,9 @@ export class AutoMemoryMiddleware {
       if (currentReserved <= 1) this.sessionReservations.delete(sessionKey);
       else this.sessionReservations.set(sessionKey, currentReserved - 1);
 
-      if (claimed && !persisted) {
+      if (reservationToken !== null && !persisted) {
         try {
-          this.dedup.release(hash);
+          this.dedup.release(hash, reservationToken);
         } catch {
           // Preserve the original analysis/save outcome; the reservation expires by TTL.
         }
