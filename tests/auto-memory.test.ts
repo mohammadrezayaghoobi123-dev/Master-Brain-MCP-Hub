@@ -148,7 +148,7 @@ describe('AutoMemoryMiddleware concurrent deduplication', () => {
 
 describe('AutoMemoryMiddleware concurrent session limits', () => {
   it('reserves per-session capacity before concurrent analysis starts', async () => {
-    mw.updateConfig({ maxEntriesPerSession: 1 });
+    const mw = new AutoMemoryMiddleware({ enabled: true, minConfidence: 0.7, maxEntriesPerSession: 1 }, memoryDedup());
 
     let releaseAnalysis!: () => void;
     const analysisGate = new Promise<void>((resolve) => {
@@ -226,7 +226,7 @@ describe('SQLite dedup reservations', () => {
 
 describe('AutoMemoryMiddleware concurrent session limits', () => {
   it('does not allow concurrent distinct interactions to exceed the per-session save limit', async () => {
-    mw.updateConfig({ maxEntriesPerSession: 1 });
+    const mw = new AutoMemoryMiddleware({ enabled: true, minConfidence: 0.7, maxEntriesPerSession: 1 }, memoryDedup());
 
     let releaseAnalysis!: () => void;
     let signalFirstAnalysis!: () => void;
