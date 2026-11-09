@@ -2,6 +2,10 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { AutoMemoryMiddleware } from '../src/middleware/auto-memory.js';
 import type { DedupStore } from '../src/lib/dedup-store.js';
 import { _resetBrainClientForTests } from '../src/brain/client.js';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createDedupStore } from '../src/lib/dedup-store.js';
 
 function memoryDedup(): DedupStore {
   const map = new Map<string, number>();
@@ -137,5 +141,27 @@ describe('AutoMemoryMiddleware concurrent deduplication', () => {
 
     mw.close();
     _resetBrainClientForTests();
+  });
+});
+
+
+describe('SQLite dedup reservations', () => {
+  it('allows only one reservation across store instances sharing the same database', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'master-brain-dedup-'));
+    const databasePath = join(directory, 'dedup.sqlite');
+    const first = createDedupStore(databasePath);
+    const second = createDedupStore(databasePath);
+    const hash = 'a'.repeat(64);
+
+    try {
+      expect(first.claim(hash, 30)).toBe(true);
+      expect(second.claim(hash, 30)).toBe(false);
+      first.release(hash);
+      expect(second.claim(hash, 30)).toBe(true);
+    } finally {
+      first.close();
+      second.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 });
