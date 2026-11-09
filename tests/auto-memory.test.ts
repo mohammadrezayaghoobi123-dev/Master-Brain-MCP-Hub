@@ -145,6 +145,63 @@ describe('AutoMemoryMiddleware concurrent deduplication', () => {
 });
 
 
+
+describe('AutoMemoryMiddleware concurrent session limits', () => {
+  it('reserves per-session capacity before concurrent analysis starts', async () => {
+    mw.updateConfig({ maxEntriesPerSession: 1 });
+
+    let releaseAnalysis!: () => void;
+    const analysisGate = new Promise<void>((resolve) => {
+      releaseAnalysis = resolve;
+    });
+    const analyze = vi.spyOn(mw as any, 'analyzeImportance').mockImplementation(async () => {
+      await analysisGate;
+      return {
+        isImportant: true,
+        type: 'decision',
+        summary: 'One allowed session entry',
+        tags: ['test'],
+        confidence: 1,
+      };
+    });
+
+    _resetBrainClientForTests();
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 201,
+      json: async () => ({
+        id: 'entry-1',
+        type: 'decision',
+        content: 'One allowed session entry',
+        tags: ['test'],
+        timestamp: new Date().toISOString(),
+        source: { tool: 'manual' },
+      }),
+    }) as unknown as typeof fetch;
+
+    const first = mw.processInteraction('request one', 'response one', {
+      tool: 'manual',
+      session_id: 'limited-session',
+    });
+    const second = await mw.processInteraction('request two', 'response two', {
+      tool: 'manual',
+      session_id: 'limited-session',
+    });
+
+    expect(second.saved).toBe(false);
+    expect(second.reason).toBe('session_rate_limit');
+    expect(analyze).toHaveBeenCalledTimes(1);
+
+    releaseAnalysis();
+    const firstResult = await first;
+    expect(firstResult.saved).toBe(true);
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+    expect(mw.getStatus().sessionCounts['limited-session']).toBe(1);
+
+    _resetBrainClientForTests();
+  });
+});
+
 describe('SQLite dedup reservations', () => {
   it('allows only one reservation across store instances sharing the same database', () => {
     const directory = mkdtempSync(join(tmpdir(), 'master-brain-dedup-'));
