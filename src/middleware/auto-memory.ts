@@ -41,6 +41,9 @@ export class AutoMemoryMiddleware {
   private config: AutoMemoryConfig;
   private anthropic: Anthropic | null = null;
   private readonly sessionEntries = new Map<string, number>();
+  // Reserve session capacity before the first await so concurrent interactions
+  // cannot all pass the same stale persisted-count check.
+  private readonly sessionReservations = new Map<string, number>();
   private readonly dedup: DedupStore;
   private purgeTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -84,17 +87,24 @@ export class AutoMemoryMiddleware {
 
     const sessionKey = source.session_id || 'default';
     const count = this.sessionEntries.get(sessionKey) || 0;
-    if (count >= this.config.maxEntriesPerSession) {
+    const reserved = this.sessionReservations.get(sessionKey) || 0;
+    if (count + reserved >= this.config.maxEntriesPerSession) {
       return { saved: false, reason: 'session_rate_limit' };
     }
 
+    // This reservation is synchronous and therefore atomic within this
+    // middleware instance, including across async analysis/save boundaries.
+    this.sessionReservations.set(sessionKey, reserved + 1);
     const hash = contentHash(request + '\n---\n' + response);
-    if (!this.dedup.claim(hash, this.config.deduplicationWindowMinutes)) {
-      return { saved: false, reason: 'duplicate' };
-    }
-
+    let claimed = false;
     let persisted = false;
+
     try {
+      if (!this.dedup.claim(hash, this.config.deduplicationWindowMinutes)) {
+        return { saved: false, reason: 'duplicate' };
+      }
+      claimed = true;
+
       let analysis: AnalysisResult;
       try {
         analysis = await this.analyzeImportance(request, response);
@@ -130,11 +140,16 @@ export class AutoMemoryMiddleware {
 
       // Start the deduplication window after the durable save succeeds.
       this.dedup.add(hash, this.config.deduplicationWindowMinutes);
-      this.sessionEntries.set(sessionKey, count + 1);
+      const currentCount = this.sessionEntries.get(sessionKey) || 0;
+      this.sessionEntries.set(sessionKey, currentCount + 1);
       persisted = true;
       return { saved: true, entry: analysis };
     } finally {
-      if (!persisted) {
+      const currentReserved = this.sessionReservations.get(sessionKey) || 0;
+      if (currentReserved <= 1) this.sessionReservations.delete(sessionKey);
+      else this.sessionReservations.set(sessionKey, currentReserved - 1);
+
+      if (claimed && !persisted) {
         try {
           this.dedup.release(hash);
         } catch {
