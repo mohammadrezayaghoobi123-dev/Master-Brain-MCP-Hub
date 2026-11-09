@@ -21,12 +21,13 @@ function memoryDedup(): DedupStore {
     },
     claim: (h, ttl) => {
       const exp = map.get(h);
-      if (exp !== undefined && Date.now() <= exp) return false;
-      map.set(h, Date.now() + ttl * 60_000);
-      return true;
+      if (exp !== undefined && Date.now() <= exp) return null;
+      const reservationToken = Date.now() + ttl * 60_000;
+      map.set(h, reservationToken);
+      return reservationToken;
     },
-    release: (h) => {
-      map.delete(h);
+    release: (h, reservationToken) => {
+      if (map.get(h) === reservationToken) map.delete(h);
     },
     add: (h, ttl) => {
       map.set(h, Date.now() + ttl * 60_000);
@@ -312,11 +313,43 @@ describe('SQLite dedup reservations', () => {
     const hash = 'a'.repeat(64);
 
     try {
-      expect(first.claim(hash, 30)).toBe(true);
-      expect(second.claim(hash, 30)).toBe(false);
-      first.release(hash);
-      expect(second.claim(hash, 30)).toBe(true);
+      const firstToken = first.claim(hash, 1);
+      expect(firstToken).toEqual(expect.any(Number));
+      expect(second.claim(hash, 1)).toBeNull();
+      first.release(hash, firstToken!);
+      const secondToken = second.claim(hash, 1);
+      expect(secondToken).toEqual(expect.any(Number));
+      second.release(hash, secondToken!);
     } finally {
+      first.close();
+      second.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('does not let an expired reservation release delete a newer claim', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'master-brain-dedup-lease-'));
+    const databasePath = join(directory, 'dedup.sqlite');
+    const first = createDedupStore(databasePath);
+    const second = createDedupStore(databasePath);
+    const hash = 'b'.repeat(64);
+    const now = vi.spyOn(Date, 'now');
+    try {
+      now.mockReturnValue(1_700_000_000_000);
+      const oldToken = first.claim(hash, 1);
+      expect(oldToken).toBe(1_700_000_060_000);
+
+      now.mockReturnValue(1_700_000_060_001);
+      const newToken = second.claim(hash, 1);
+      expect(newToken).toBe(1_700_000_120_001);
+
+      first.release(hash, oldToken!);
+      expect(second.has(hash)).toBe(true);
+
+      second.release(hash, newToken!);
+      expect(second.has(hash)).toBe(false);
+    } finally {
+      now.mockRestore();
       first.close();
       second.close();
       rmSync(directory, { recursive: true, force: true });
