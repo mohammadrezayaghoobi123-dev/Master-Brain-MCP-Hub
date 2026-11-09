@@ -8,8 +8,10 @@ const require = createRequire(import.meta.url);
 
 export interface DedupStore {
   has(hash: string): boolean;
-  claim(hash: string, ttlMinutes: number): boolean;
-  release(hash: string): void;
+  /** Returns the reservation's expiry token, or null when another claim is active. */
+  claim(hash: string, ttlMinutes: number): number | null;
+  /** Releases only the exact reservation returned by claim(). */
+  release(hash: string, reservationToken: number): void;
   add(hash: string, ttlMinutes: number): void;
   purgeExpired(): number;
   size(): number;
@@ -29,14 +31,15 @@ class MemoryDedupStore implements DedupStore {
     return true;
   }
 
-  claim(hash: string, ttlMinutes: number): boolean {
-    if (this.has(hash)) return false;
-    this.add(hash, ttlMinutes);
-    return true;
+  claim(hash: string, ttlMinutes: number): number | null {
+    if (this.has(hash)) return null;
+    const expiresAt = Date.now() + ttlMinutes * 60_000;
+    this.entries.set(hash, expiresAt);
+    return expiresAt;
   }
 
-  release(hash: string): void {
-    this.entries.delete(hash);
+  release(hash: string, reservationToken: number): void {
+    if (this.entries.get(hash) === reservationToken) this.entries.delete(hash);
   }
 
   add(hash: string, ttlMinutes: number): void {
@@ -101,17 +104,19 @@ class SqliteDedupStore implements DedupStore {
     return Boolean(row);
   }
 
-  claim(hash: string, ttlMinutes: number): boolean {
+  claim(hash: string, ttlMinutes: number): number | null {
     this.purgeExpired();
     const expiresAt = Date.now() + ttlMinutes * 60_000;
     const result = this.db
       .prepare('INSERT OR IGNORE INTO content_hashes(hash, expires_at) VALUES(?, ?)')
       .run(hash, expiresAt);
-    return result.changes === 1;
+    return result.changes === 1 ? expiresAt : null;
   }
 
-  release(hash: string): void {
-    this.db.prepare('DELETE FROM content_hashes WHERE hash = ?').run(hash);
+  release(hash: string, reservationToken: number): void {
+    this.db
+      .prepare('DELETE FROM content_hashes WHERE hash = ? AND expires_at = ?')
+      .run(hash, reservationToken);
   }
 
   add(hash: string, ttlMinutes: number): void {
