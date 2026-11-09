@@ -14,8 +14,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  validate:
-    name: test-typecheck-build
+  quality:
+    name: typecheck-test-build
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -30,13 +30,10 @@ jobs:
           node-version: "22"
           package-manager-cache: false
 
-      # package-lock.json is currently absent; npm install is used until a
-      # reviewed lockfile is committed. No production secrets are required.
+      # package-lock.json is currently absent; npm install is temporary until
+      # a reviewed lockfile is committed. No production secrets are required.
       - name: Install dependencies
         run: npm install --no-audit --no-fund
-
-      - name: Audit dependency advisories
-        run: npm audit --audit-level=moderate
 
       - name: Type check
         run: npm run typecheck
@@ -46,3 +43,25 @@ jobs:
 
       - name: Build
         run: npm run build
+
+  dependency-audit:
+    name: npm-audit-moderate-plus
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          package-manager-cache: false
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Audit dependency advisories
+        run: npm audit --audit-level=moderate
