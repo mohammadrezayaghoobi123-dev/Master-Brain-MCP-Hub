@@ -15,6 +15,15 @@ function memoryDedup(): DedupStore {
       }
       return true;
     },
+    claim: (h, ttl) => {
+      const exp = map.get(h);
+      if (exp !== undefined && Date.now() <= exp) return false;
+      map.set(h, Date.now() + ttl * 60_000);
+      return true;
+    },
+    release: (h) => {
+      map.delete(h);
+    },
     add: (h, ttl) => {
       map.set(h, Date.now() + ttl * 60_000);
     },
