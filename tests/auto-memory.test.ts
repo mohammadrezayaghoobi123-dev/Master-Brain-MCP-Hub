@@ -202,6 +202,107 @@ describe('AutoMemoryMiddleware concurrent session limits', () => {
   });
 });
 
+
+describe('AutoMemoryMiddleware reservation recovery', () => {
+  const analysis = {
+    isImportant: true,
+    type: 'decision' as const,
+    summary: 'Retryable durable decision',
+    tags: ['recovery'],
+    confidence: 1,
+  };
+
+  it('releases dedup and session reservations after analysis failure', async () => {
+    const dedup = memoryDedup();
+    const mw = new AutoMemoryMiddleware(
+      { enabled: true, minConfidence: 0.7, maxEntriesPerSession: 1 },
+      dedup
+    );
+    const analyze = vi.spyOn(mw as any, 'analyzeImportance')
+      .mockRejectedValueOnce(new Error('temporary analysis failure'))
+      .mockResolvedValueOnce(analysis);
+    _resetBrainClientForTests();
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 201,
+      json: async () => ({
+        id: 'entry-retry',
+        type: 'decision',
+        content: analysis.summary,
+        tags: analysis.tags,
+        timestamp: new Date().toISOString(),
+        source: { tool: 'manual', session_id: 'recovery-session' },
+      }),
+    }) as unknown as typeof fetch;
+
+    try {
+      await expect(mw.processInteraction('retry request', 'retry response', {
+        tool: 'manual',
+        session_id: 'recovery-session',
+      })).rejects.toThrow('temporary analysis failure');
+
+      await expect(mw.processInteraction('retry request', 'retry response', {
+        tool: 'manual',
+        session_id: 'recovery-session',
+      })).resolves.toMatchObject({ saved: true });
+
+      expect(analyze).toHaveBeenCalledTimes(2);
+      expect(global.fetch).toHaveBeenCalledTimes(1);
+      expect(mw.getStatus().sessionCounts['recovery-session']).toBe(1);
+    } finally {
+      mw.close();
+      _resetBrainClientForTests();
+    }
+  });
+
+  it('releases dedup and session reservations after brain save failure', async () => {
+    const dedup = memoryDedup();
+    const mw = new AutoMemoryMiddleware(
+      { enabled: true, minConfidence: 0.7, maxEntriesPerSession: 1 },
+      dedup
+    );
+    const analyze = vi.spyOn(mw as any, 'analyzeImportance').mockResolvedValue(analysis);
+    _resetBrainClientForTests();
+    global.fetch = vi.fn()
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 503,
+        json: async () => ({ message: 'temporary backend failure' }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 201,
+        json: async () => ({
+          id: 'entry-retry',
+          type: 'decision',
+          content: analysis.summary,
+          tags: analysis.tags,
+          timestamp: new Date().toISOString(),
+          source: { tool: 'manual', session_id: 'save-recovery-session' },
+        }),
+      }) as unknown as typeof fetch;
+
+    try {
+      await expect(mw.processInteraction('save retry request', 'save retry response', {
+        tool: 'manual',
+        session_id: 'save-recovery-session',
+      })).rejects.toThrow('temporary backend failure');
+
+      await expect(mw.processInteraction('save retry request', 'save retry response', {
+        tool: 'manual',
+        session_id: 'save-recovery-session',
+      })).resolves.toMatchObject({ saved: true });
+
+      expect(analyze).toHaveBeenCalledTimes(2);
+      expect(global.fetch).toHaveBeenCalledTimes(2);
+      expect(mw.getStatus().sessionCounts['save-recovery-session']).toBe(1);
+    } finally {
+      mw.close();
+      _resetBrainClientForTests();
+    }
+  });
+});
+
 describe('SQLite dedup reservations', () => {
   it('allows only one reservation across store instances sharing the same database', () => {
     const directory = mkdtempSync(join(tmpdir(), 'master-brain-dedup-'));
