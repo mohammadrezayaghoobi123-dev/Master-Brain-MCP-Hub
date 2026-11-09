@@ -165,3 +165,69 @@ describe('SQLite dedup reservations', () => {
     }
   });
 });
+
+
+describe('AutoMemoryMiddleware concurrent session limits', () => {
+  it('does not allow concurrent distinct interactions to exceed the per-session save limit', async () => {
+    mw.updateConfig({ maxEntriesPerSession: 1 });
+
+    let releaseAnalysis!: () => void;
+    let signalFirstAnalysis!: () => void;
+    let signalSecondAnalysis!: () => void;
+    const analysisGate = new Promise<void>((resolve) => { releaseAnalysis = resolve; });
+    const firstStarted = new Promise<void>((resolve) => { signalFirstAnalysis = resolve; });
+    const secondStarted = new Promise<void>((resolve) => { signalSecondAnalysis = resolve; });
+
+    let analysisCalls = 0;
+    vi.spyOn(mw as any, 'analyzeImportance').mockImplementation(async () => {
+      analysisCalls += 1;
+      if (analysisCalls === 1) signalFirstAnalysis();
+      else signalSecondAnalysis();
+      await analysisGate;
+      return {
+        isImportant: true,
+        type: 'decision',
+        summary: 'A durable decision',
+        tags: ['test'],
+        confidence: 1,
+      };
+    });
+
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        id: 'entry-1',
+        type: 'decision',
+        content: 'A durable decision',
+        tags: ['test'],
+        source: { tool: 'manual', session_id: 'session-1' },
+        timestamp: '2026-11-09T00:00:00.000Z',
+      }),
+    });
+    global.fetch = fetchMock as any;
+
+    const first = mw.processInteraction('request one', 'response one', {
+      tool: 'manual',
+      session_id: 'session-1',
+    });
+    await firstStarted;
+
+    const secondPromise = mw.processInteraction('request two', 'response two', {
+      tool: 'manual',
+      session_id: 'session-1',
+    });
+    const secondOutcome = await Promise.race([
+      secondPromise.then((result) => ({ kind: 'result' as const, result })),
+      secondStarted.then(() => ({ kind: 'analysis' as const })),
+    ]);
+
+    expect(secondOutcome).toEqual({
+      kind: 'result',
+      result: { saved: false, reason: 'session_rate_limit' },
+    });
+
+    releaseAnalysis();
+    expect(await first).toMatchObject({ saved: true });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});
