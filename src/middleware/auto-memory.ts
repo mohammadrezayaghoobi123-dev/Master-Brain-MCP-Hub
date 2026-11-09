@@ -89,47 +89,59 @@ export class AutoMemoryMiddleware {
     }
 
     const hash = contentHash(request + '\n---\n' + response);
-    if (this.dedup.has(hash)) {
+    if (!this.dedup.claim(hash, this.config.deduplicationWindowMinutes)) {
       return { saved: false, reason: 'duplicate' };
     }
 
-    let analysis: AnalysisResult;
+    let persisted = false;
     try {
-      analysis = await this.analyzeImportance(request, response);
-    } catch (error) {
-      if (error instanceof AppError) throw error;
-      throw new AppError(
-        'ANALYSIS_FAILED',
-        error instanceof Error ? error.message : 'Analysis failed'
-      );
+      let analysis: AnalysisResult;
+      try {
+        analysis = await this.analyzeImportance(request, response);
+      } catch (error) {
+        if (error instanceof AppError) throw error;
+        throw new AppError(
+          'ANALYSIS_FAILED',
+          error instanceof Error ? error.message : 'Analysis failed'
+        );
+      }
+
+      if (!analysis.isImportant || analysis.confidence < this.config.minConfidence) {
+        return { saved: false, reason: 'below_threshold', entry: analysis };
+      }
+
+      if (this.config.excludeTypes.includes(analysis.type)) {
+        return { saved: false, reason: 'excluded_type', entry: analysis };
+      }
+
+      const brain = getBrainClient();
+      await brain.save({
+        type: analysis.type,
+        content: analysis.summary,
+        tags: analysis.tags,
+        source: { ...source, tool: source.tool === 'manual' ? 'manual' : 'auto-memory' },
+        metadata: {
+          confidence: analysis.confidence,
+          originalRequest: request.substring(0, 500),
+          context: analysis.context,
+          contentHash: hash,
+        },
+      });
+
+      // Start the deduplication window after the durable save succeeds.
+      this.dedup.add(hash, this.config.deduplicationWindowMinutes);
+      this.sessionEntries.set(sessionKey, count + 1);
+      persisted = true;
+      return { saved: true, entry: analysis };
+    } finally {
+      if (!persisted) {
+        try {
+          this.dedup.release(hash);
+        } catch {
+          // Preserve the original analysis/save outcome; the reservation expires by TTL.
+        }
+      }
     }
-
-    if (!analysis.isImportant || analysis.confidence < this.config.minConfidence) {
-      return { saved: false, reason: 'below_threshold', entry: analysis };
-    }
-
-    if (this.config.excludeTypes.includes(analysis.type)) {
-      return { saved: false, reason: 'excluded_type', entry: analysis };
-    }
-
-    const brain = getBrainClient();
-    await brain.save({
-      type: analysis.type,
-      content: analysis.summary,
-      tags: analysis.tags,
-      source: { ...source, tool: source.tool === 'manual' ? 'manual' : 'auto-memory' },
-      metadata: {
-        confidence: analysis.confidence,
-        originalRequest: request.substring(0, 500),
-        context: analysis.context,
-        contentHash: hash,
-      },
-    });
-
-    this.sessionEntries.set(sessionKey, count + 1);
-    this.dedup.add(hash, this.config.deduplicationWindowMinutes);
-
-    return { saved: true, entry: analysis };
   }
 
   private async analyzeImportance(request: string, response: string): Promise<AnalysisResult> {
