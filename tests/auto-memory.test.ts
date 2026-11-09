@@ -216,7 +216,7 @@ describe('AutoMemoryMiddleware reservation recovery', () => {
   it('releases dedup and session reservations after analysis failure', async () => {
     const dedup = memoryDedup();
     const mw = new AutoMemoryMiddleware(
-      { enabled: true, minConfidence: 0.7, maxEntriesPerSession: 1 },
+      { enabled: true, minConfidence: 0.7, maxEntriesPerSession: 2 },
       dedup
     );
     const analyze = vi.spyOn(mw as any, 'analyzeImportance')
