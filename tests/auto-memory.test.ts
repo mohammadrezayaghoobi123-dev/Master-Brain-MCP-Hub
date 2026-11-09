@@ -1,6 +1,7 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { AutoMemoryMiddleware } from '../src/middleware/auto-memory.js';
 import type { DedupStore } from '../src/lib/dedup-store.js';
+import { _resetBrainClientForTests } from '../src/brain/client.js';
 
 function memoryDedup(): DedupStore {
   const map = new Map<string, number>();
