@@ -431,7 +431,7 @@ describe('AutoMemoryMiddleware durable-save recovery', () => {
       throw new Error('temporary dedup store failure');
     });
     const mw = new AutoMemoryMiddleware(
-      { enabled: true, minConfidence: 0.7, maxEntriesPerSession: 1 },
+      { enabled: true, minConfidence: 0.7, maxEntriesPerSession: 2 },
       dedup
     );
     const analysis = {
