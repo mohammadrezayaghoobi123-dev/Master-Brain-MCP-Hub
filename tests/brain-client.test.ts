@@ -117,3 +117,34 @@ describe('BrainClient timeout validation', () => {
     }
   );
 });
+
+
+describe('timeout upper-bound validation', () => {
+  it.each([2_147_483_648, Number.MAX_VALUE])(
+    'uses the 30-second default when BrainClient timeout exceeds Node timer maximum (%s)',
+    async (timeoutMs) => {
+      let scheduledDelay: number | undefined;
+      const timerSpy = vi.spyOn(globalThis, 'setTimeout').mockImplementation(((
+        _handler: TimerHandler,
+        timeout?: number
+      ) => {
+        scheduledDelay = Number(timeout);
+        return 0 as unknown as ReturnType<typeof setTimeout>;
+      }) as typeof setTimeout);
+      const originalFetch = global.fetch;
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ totalEntries: 0 }),
+      }) as unknown as typeof fetch;
+
+      try {
+        const client = new BrainClient({ baseUrl: 'http://localhost:3001', timeoutMs });
+        await client.stats();
+        expect(scheduledDelay).toBe(30_000);
+      } finally {
+        global.fetch = originalFetch;
+        timerSpy.mockRestore();
+      }
+    }
+  );
+});
