@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -10,6 +11,7 @@ import { contentHash } from '../src/lib/hash.js';
 import { _resetBrainClientForTests } from '../src/brain/client.js';
 
 const require = createRequire(import.meta.url);
+const originalFetch = global.fetch;
 const T0 = 1_700_000_000_000;
 const MIN = 60_000;
 
@@ -28,6 +30,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  global.fetch = originalFetch;
   vi.restoreAllMocks();
   _resetBrainClientForTests();
   rmSync(dir, { recursive: true, force: true });
@@ -443,6 +446,44 @@ describe('observability', () => {
     const sqlite = makeMw(createDedupStore(dbPath));
     expect(sqlite.getStatus().dedupBackend).toBe('sqlite');
     sqlite.close();
+  });
+});
+
+describe('SQLite multi-process atomicity', () => {
+  it('allows exactly one independent Node process to claim the same hash', async () => {
+    // Initialize schema before racing so this test isolates claim atomicity, not DDL startup.
+    const initialized = createDedupStore(dbPath);
+    initialized.close();
+
+    const childScript = `
+      import { createDedupStore } from './src/lib/dedup-store.ts';
+      const store = createDedupStore(process.argv[1]);
+      const token = store.claim('cross-process-hash', 5);
+      process.stdout.write(token === null ? 'null' : token);
+      store.close();
+    `;
+
+    const claimInChild = () =>
+      new Promise<string | null>((resolve, reject) => {
+        const child = spawn(
+          process.execPath,
+          ['--import', 'tsx', '--input-type=module', '-e', childScript, dbPath],
+          { cwd: process.cwd(), env: process.env, stdio: ['ignore', 'pipe', 'pipe'] }
+        );
+        let stdout = '';
+        let stderr = '';
+        child.stdout.setEncoding('utf8').on('data', (chunk: string) => (stdout += chunk));
+        child.stderr.setEncoding('utf8').on('data', (chunk: string) => (stderr += chunk));
+        child.once('error', reject);
+        child.once('close', (code) => {
+          if (code !== 0) return reject(new Error(`child claim failed (${code}): ${stderr}`));
+          resolve(stdout === 'null' ? null : stdout);
+        });
+      });
+
+    const results = await Promise.all([claimInChild(), claimInChild()]);
+    expect(results.filter((token) => token !== null)).toHaveLength(1);
+    expect(results.filter((token) => token === null)).toHaveLength(1);
   });
 });
 
