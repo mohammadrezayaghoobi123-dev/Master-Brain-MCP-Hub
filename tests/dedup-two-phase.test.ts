@@ -148,6 +148,22 @@ describe.each([
     expect(store.claim('h', 1)).toBeNull();
   });
 
+  it('add can promote only the matching pending owner during recovery', () => {
+    const owner = store.claim('h', 5)!;
+    store.add('h', 30, owner);
+    expect(store.status('h')).toBe('committed');
+  });
+
+  it('add with a stale owner token cannot overwrite a successor reservation', () => {
+    const stale = store.claim('h', 1)!;
+    advance(MIN + 1);
+    const successor = store.claim('h', 5)!;
+    store.add('h', 30, stale);
+    expect(store.status('h')).toBe('pending');
+    expect(store.commit('h', successor, 30)).toBe(true);
+    expect(store.status('h')).toBe('committed');
+  });
+
   it('add cannot overwrite a live pending reservation', () => {
     const owner = store.claim('h', 5)!;
     store.add('h', 30);

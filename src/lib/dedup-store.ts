@@ -35,8 +35,8 @@ export interface DedupStore {
   commit(hash: string, token: string, ttlMinutes: number): boolean;
   /** Deletes the entry only if it is still the caller's PENDING reservation. */
   release(hash: string, token: string): void;
-  /** Records a committed entry only when no live entry exists; never overwrites a pending owner. */
-  add(hash: string, ttlMinutes: number): void;
+  /** Records a committed entry if free, or promotes only the matching pending owner when a token is supplied. */
+  add(hash: string, ttlMinutes: number, token?: string): void;
   purgeExpired(): number;
   size(): number;
   close(): void;
@@ -105,9 +105,15 @@ class MemoryDedupStore implements DedupStore {
     if (e && e.state === 'pending' && e.owner === token) this.entries.delete(hash);
   }
 
-  add(hash: string, ttlMinutes: number): void {
-    // Recovery writes must not replace a live pending reservation owned by another interaction.
-    if (this.live(hash)) return;
+  add(hash: string, ttlMinutes: number, token?: string): void {
+    const current = this.live(hash);
+    // A recovery write may promote its own reservation, but never a successor's.
+    if (current) {
+      if (token && current.state === 'pending' && current.owner === token) {
+        this.entries.set(hash, { exp: Date.now() + ttlMinutes * 60_000, state: 'committed', owner: null });
+      }
+      return;
+    }
     this.entries.set(hash, { exp: Date.now() + ttlMinutes * 60_000, state: 'committed', owner: null });
   }
 
@@ -222,14 +228,23 @@ class SqliteDedupStore implements DedupStore {
       .run(hash, token);
   }
 
-  add(hash: string, ttlMinutes: number): void {
-    // Recovery writes must not replace a live pending reservation owned by another interaction.
+  add(hash: string, ttlMinutes: number, token?: string): void {
     this.purgeExpired();
+    const expiresAt = Date.now() + ttlMinutes * 60_000;
+    if (token) {
+      const promoted = this.db
+        .prepare(
+          "UPDATE content_hashes SET state = 'committed', owner = NULL, expires_at = ? WHERE hash = ? AND state = 'pending' AND owner = ?"
+        )
+        .run(expiresAt, hash, token);
+      if (promoted.changes === 1) return;
+    }
+    // If the key is free, record the durable save. INSERT OR IGNORE preserves a successor.
     this.db
       .prepare(
         "INSERT OR IGNORE INTO content_hashes(hash, expires_at, state, owner) VALUES(?, ?, 'committed', NULL)"
       )
-      .run(hash, Date.now() + ttlMinutes * 60_000);
+      .run(hash, expiresAt);
   }
 
   purgeExpired(): number {

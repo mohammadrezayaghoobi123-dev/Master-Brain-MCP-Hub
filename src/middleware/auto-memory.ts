@@ -161,7 +161,7 @@ export class AutoMemoryMiddleware {
       } catch (err) {
         this.logDedupError('commit', err);
         try {
-          this.dedup.add(hash, this.config.deduplicationWindowMinutes);
+          this.dedup.add(hash, this.config.deduplicationWindowMinutes, reservationToken);
         } catch (err2) {
           this.logDedupError('add', err2); // claim then expires with its lease
         }
