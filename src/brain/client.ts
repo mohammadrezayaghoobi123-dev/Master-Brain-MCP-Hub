@@ -8,6 +8,12 @@ import type {
 } from '../types/index.js';
 import { AppError } from '../lib/errors.js';
 
+const DEFAULT_BRAIN_TIMEOUT_MS = 30_000;
+
+function finitePositiveTimeout(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
 export interface BrainClientConfig {
   baseUrl: string;
   apiKey?: string;
@@ -22,7 +28,7 @@ export class BrainClient {
   constructor(config: BrainClientConfig) {
     this.baseUrl = config.baseUrl.replace(/\/$/, '');
     this.apiKey = config.apiKey;
-    this.timeoutMs = config.timeoutMs ?? 30_000;
+    this.timeoutMs = finitePositiveTimeout(config.timeoutMs, DEFAULT_BRAIN_TIMEOUT_MS);
   }
 
   private async request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
