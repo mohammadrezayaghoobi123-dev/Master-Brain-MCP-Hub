@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createDedupStore } from '../src/lib/dedup-store.js';
@@ -32,15 +32,19 @@ describe('SQLiteDedupStore integration', () => {
   });
 
   it('fails closed instead of falling back to memory when SQLite is required', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'master-brain-dedup-fail-'));
+    const blocker = join(dir, 'not-a-directory');
+    writeFileSync(blocker, 'file');
     const previous = process.env.DEDUP_REQUIRE_SQLITE;
     process.env.DEDUP_REQUIRE_SQLITE = '1';
     try {
-      expect(() => createDedupStore('/proc/master-brain-dedup/blocked.sqlite')).toThrow(
+      expect(() => createDedupStore(join(blocker, 'blocked.sqlite'))).toThrow(
         /SQLite is required but unavailable; refusing in-memory fallback/
       );
     } finally {
       if (previous === undefined) delete process.env.DEDUP_REQUIRE_SQLITE;
       else process.env.DEDUP_REQUIRE_SQLITE = previous;
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });
