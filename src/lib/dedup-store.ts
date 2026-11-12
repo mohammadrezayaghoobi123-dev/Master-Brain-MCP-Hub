@@ -152,23 +152,33 @@ class SqliteDedupStore implements DedupStore {
 
     mkdirSync(dirname(dbPath), { recursive: true });
     this.db = new Database(dbPath);
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS content_hashes (
-        hash TEXT PRIMARY KEY,
-        expires_at INTEGER NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS idx_hashes_expires ON content_hashes(expires_at);
-    `);
-    // Additive, idempotent migration: rows written by older versions become 'committed'.
-    for (const ddl of [
-      "ALTER TABLE content_hashes ADD COLUMN state TEXT NOT NULL DEFAULT 'committed'",
-      'ALTER TABLE content_hashes ADD COLUMN owner TEXT',
-    ]) {
-      try {
-        this.db.exec(ddl);
-      } catch (err) {
-        if (!/duplicate column/i.test(err instanceof Error ? err.message : String(err))) throw err;
+    try {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS content_hashes (
+          hash TEXT PRIMARY KEY,
+          expires_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_hashes_expires ON content_hashes(expires_at);
+      `);
+      // Additive, idempotent migration: rows written by older versions become 'committed'.
+      for (const ddl of [
+        "ALTER TABLE content_hashes ADD COLUMN state TEXT NOT NULL DEFAULT 'committed'",
+        'ALTER TABLE content_hashes ADD COLUMN owner TEXT',
+      ]) {
+        try {
+          this.db.exec(ddl);
+        } catch (err) {
+          if (!/duplicate column/i.test(err instanceof Error ? err.message : String(err))) throw err;
+        }
       }
+    } catch (error) {
+      // A partially initialized native SQLite handle must never leak on schema/migration failure.
+      try {
+        this.db.close();
+      } catch {
+        // Preserve the original schema/migration error.
+      }
+      throw error;
     }
   }
 
