@@ -577,6 +577,7 @@ describe('Auto-Memory analysis timeout validation', () => {
       const create = vi.fn().mockResolvedValue({
         content: [{ type: 'text', text: JSON.stringify(analysis) }],
       });
+      vi.spyOn(mw as any, 'analyzeImportance').mockRestore();
       vi.spyOn(mw as any, 'getAnthropic').mockReturnValue({ messages: { create } });
 
       try {
@@ -598,6 +599,7 @@ describe('Auto-Memory analysis timeout validation', () => {
     const create = vi.fn().mockResolvedValue({
       content: [{ type: 'text', text: JSON.stringify(analysis) }],
     });
+    vi.spyOn(mw as any, 'analyzeImportance').mockRestore();
     vi.spyOn(mw as any, 'getAnthropic').mockReturnValue({ messages: { create } });
     mw.updateConfig({ analysisTimeoutMs: Number.POSITIVE_INFINITY });
 
