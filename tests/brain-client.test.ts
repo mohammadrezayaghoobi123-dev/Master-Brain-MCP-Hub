@@ -88,3 +88,32 @@ describe('BrainClient — API calls', () => {
     await expect(client.stats()).rejects.toMatchObject({ code: 'BRAIN_HTTP_ERROR' });
   });
 });
+
+
+describe('BrainClient timeout validation', () => {
+  it.each([Number.NaN, Number.POSITIVE_INFINITY, 0, -1])(
+    'uses the 30-second default for invalid timeout %s',
+    async (timeoutMs) => {
+      let scheduledDelay: number | undefined;
+      const timerSpy = vi.spyOn(globalThis, 'setTimeout').mockImplementation(((
+        _handler: TimerHandler,
+        timeout?: number
+      ) => {
+        scheduledDelay = Number(timeout);
+        return 0 as unknown as ReturnType<typeof setTimeout>;
+      }) as typeof setTimeout);
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ totalEntries: 0 }),
+      }) as unknown as typeof fetch;
+
+      try {
+        const invalidClient = new BrainClient({ baseUrl: 'http://localhost:3001', timeoutMs });
+        await invalidClient.stats();
+        expect(scheduledDelay).toBe(30_000);
+      } finally {
+        timerSpy.mockRestore();
+      }
+    }
+  );
+});
