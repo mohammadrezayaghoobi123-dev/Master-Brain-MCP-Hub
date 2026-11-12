@@ -9,9 +9,13 @@ import type {
 import { AppError } from '../lib/errors.js';
 
 const DEFAULT_BRAIN_TIMEOUT_MS = 30_000;
+// Node timers clamp delays above 2^31-1 ms to 1 ms.
+const MAX_NODE_TIMEOUT_MS = 2_147_483_647;
 
 function finitePositiveTimeout(value: unknown, fallback: number): number {
-  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback;
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 && value <= MAX_NODE_TIMEOUT_MS
+    ? value
+    : fallback;
 }
 
 export interface BrainClientConfig {
