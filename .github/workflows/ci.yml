@@ -15,9 +15,13 @@ concurrency:
 
 jobs:
   quality:
-    name: typecheck-test-build
+    name: quality-node-${{ matrix.node-version }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [22, 24, 26]
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -27,13 +31,11 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: "22"
+          node-version: ${{ matrix.node-version }}
           package-manager-cache: false
 
-      # package-lock.json is currently absent; npm install is temporary until
-      # a reviewed lockfile is committed. No production secrets are required.
       - name: Install dependencies
-        run: npm install --no-audit --no-fund
+        run: npm ci --no-audit --no-fund
 
       - name: Type check
         run: npm run typecheck
@@ -64,7 +66,7 @@ jobs:
           package-manager-cache: false
 
       - name: Install dependencies
-        run: npm install --no-audit --no-fund
+        run: npm ci --no-audit --no-fund
 
       - name: Audit dependency advisories
         run: npm audit --audit-level=moderate
