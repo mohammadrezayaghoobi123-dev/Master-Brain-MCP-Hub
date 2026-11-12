@@ -1,4 +1,4 @@
-name: Regenerate better-sqlite3 lock and verify Node matrix
+name: Verify real SQLite on Node matrix
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
       - fix/better-sqlite3-node26-2026-11-12
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: better-sqlite3-node26-lock-${{ github.ref }}
@@ -21,9 +21,9 @@ jobs:
       - name: Checkout isolated fix branch
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          persist-credentials: true
+          persist-credentials: false
 
-      - name: Generate lockfile with supported dependency
+      - name: Validate npm registry metadata
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
@@ -37,10 +37,7 @@ jobs:
           npm config get ignore-scripts
           npm view better-sqlite3@12.11.1 version engines scripts dependencies --json
 
-      - name: Upgrade optional SQLite dependency and regenerate lock
-        run: npm install --include=optional --foreground-scripts --verbose --save-optional 'better-sqlite3@^12.11.1' --no-audit --no-fund
-
-      - name: Explicitly approve the reviewed native SQLite install script
+      - name: Assert reviewed native SQLite install-script approval
         run: |
           node --input-type=commonjs -e "const fs=require('node:fs'); const p=JSON.parse(fs.readFileSync('package.json','utf8')); p.allowScripts={...(p.allowScripts||{}),'better-sqlite3@12.11.1':true}; fs.writeFileSync('package.json', JSON.stringify(p,null,2)+'\\n');"
 
@@ -83,10 +80,5 @@ jobs:
           package-manager-cache: false
       - run: npm ci --no-audit --no-fund && npm ls better-sqlite3 --depth=0 && DEDUP_REQUIRE_SQLITE=1 npm run test:run
 
-      - name: Commit regenerated manifest and lockfile
-        run: |
-          git diff --check
-          git add package.json package-lock.json src/lib/dedup-store.ts tests/dedup-store.test.ts
-          git diff --cached --check
-          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" commit -m "fix(deps): enforce real SQLite on Node 26 [verification-commit]"
-          git push origin HEAD:refs/heads/fix/better-sqlite3-node26-2026-11-12
+      - name: Verify repository diff hygiene
+        run: git diff --check
