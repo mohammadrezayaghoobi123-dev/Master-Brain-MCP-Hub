@@ -29,8 +29,9 @@ export interface DedupStore {
   claim(hash: string, leaseMinutes: number): string | null;
   /**
    * Promote the caller's pending reservation to committed for `ttlMinutes`.
-   * If ownership was lost, record the durable save only when no current row exists;
-   * never overwrite a successor's live reservation. Returns false when ownership was lost.
+   * The caller invokes this only after the Brain confirms a durable save. Persist that
+   * fact even if the original lease expired and a successor claimed the same hash.
+   * Returns false when the caller no longer owned the pending reservation.
    */
   commit(hash: string, token: string, ttlMinutes: number): boolean;
   /** Deletes the entry only if it is still the caller's PENDING reservation. */
@@ -79,25 +80,18 @@ class MemoryDedupStore implements DedupStore {
 
   commit(hash: string, token: string, ttlMinutes: number): boolean {
     const e = this.live(hash);
-    if (e?.state === 'pending' && e.owner === token) {
-      this.entries.set(hash, {
-        exp: Date.now() + ttlMinutes * 60_000,
-        state: 'committed',
-        owner: null,
-      });
-      return true;
-    }
+    const owned = e?.state === 'pending' && e.owner === token;
 
-    // A stale owner must never overwrite a newer pending reservation.
-    // If the row expired and no successor claimed it, record the durable save.
-    if (!e) {
-      this.entries.set(hash, {
-        exp: Date.now() + ttlMinutes * 60_000,
-        state: 'committed',
-        owner: null,
-      });
-    }
-    return false;
+    // This method is called only after the Brain save was acknowledged.
+    // Durable success outranks any still-live pending lease for the same hash:
+    // retaining that lease after a confirmed save could lose the committed marker
+    // if the successor later fails before its own save.
+    this.entries.set(hash, {
+      exp: Date.now() + ttlMinutes * 60_000,
+      state: 'committed',
+      owner: null,
+    });
+    return Boolean(owned);
   }
 
   release(hash: string, token: string): void {
@@ -203,22 +197,29 @@ class SqliteDedupStore implements DedupStore {
   }
 
   commit(hash: string, token: string, ttlMinutes: number): boolean {
+    const expiresAt = Date.now() + ttlMinutes * 60_000;
     const result = this.db
       .prepare(
         `UPDATE content_hashes SET state = 'committed', owner = NULL, expires_at = ?
          WHERE hash = ? AND state = 'pending' AND owner = ?`
       )
-      .run(Date.now() + ttlMinutes * 60_000, hash, token);
+      .run(expiresAt, hash, token);
     if (result.changes === 1) return true;
 
-    // Remove only expired rows, then record the durable save only if the key is free.
-    // INSERT OR IGNORE cannot replace a newer owner's live pending reservation.
-    this.purgeExpired();
+    // The Brain save was acknowledged. Record that durable fact even if this
+    // lease expired and a successor claimed the hash in the meantime. The
+    // UPSERT is atomic and prevents a later failed successor from erasing
+    // knowledge that the earlier request was already persisted.
     this.db
       .prepare(
-        "INSERT OR IGNORE INTO content_hashes(hash, expires_at, state, owner) VALUES(?, ?, 'committed', NULL)"
+        `INSERT INTO content_hashes(hash, expires_at, state, owner)
+         VALUES(?, ?, 'committed', NULL)
+         ON CONFLICT(hash) DO UPDATE SET
+           expires_at = excluded.expires_at,
+           state = 'committed',
+           owner = NULL`
       )
-      .run(hash, Date.now() + ttlMinutes * 60_000);
+      .run(hash, expiresAt);
     return false;
   }
 
