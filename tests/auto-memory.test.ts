@@ -244,8 +244,8 @@ describe('AutoMemoryMiddleware reservation recovery', () => {
     global.fetch = vi.fn()
       .mockResolvedValueOnce({
         ok: false,
-        status: 503,
-        json: async () => ({ message: 'temporary backend failure' }),
+        status: 400,
+        json: async () => ({ message: 'definitive backend rejection' }),
       })
       .mockResolvedValueOnce({
         ok: true,
@@ -264,7 +264,7 @@ describe('AutoMemoryMiddleware reservation recovery', () => {
       await expect(mw.processInteraction('save retry request', 'save retry response', {
         tool: 'manual',
         session_id: 'save-recovery-session',
-      })).rejects.toThrow('temporary backend failure');
+      })).rejects.toThrow('definitive backend rejection');
 
       await expect(mw.processInteraction('save retry request', 'save retry response', {
         tool: 'manual',

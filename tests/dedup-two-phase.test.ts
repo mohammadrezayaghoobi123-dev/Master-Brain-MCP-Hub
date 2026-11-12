@@ -372,12 +372,19 @@ describe('SQLite unavailable (controlled)', () => {
     throw Object.assign(new Error("Cannot find module 'better-sqlite3'"), { code: 'MODULE_NOT_FOUND' });
   };
 
-  it('falls back to memory by default, and says so via backend', () => {
-    const spy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
-    const store = createDedupStore(':memory:', { requireSqlite: false, loadDriver: failingLoader });
-    expect(store.backend).toBe('memory');
-    expect(spy).toHaveBeenCalled();
-    store.close();
+  it('falls back to memory outside production when explicitly allowed, and reports its backend', () => {
+    const previousNodeEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'test';
+    try {
+      const spy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      const store = createDedupStore(':memory:', { requireSqlite: false, loadDriver: failingLoader });
+      expect(store.backend).toBe('memory');
+      expect(spy).toHaveBeenCalled();
+      store.close();
+    } finally {
+      if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = previousNodeEnv;
+    }
   });
 
   it('fails closed when SQLite is required', () => {
