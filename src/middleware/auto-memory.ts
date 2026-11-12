@@ -201,9 +201,10 @@ export class AutoMemoryMiddleware {
     if (error.code === 'RATE_LIMITED') return true;
     if (error.code !== 'BRAIN_HTTP_ERROR') return false; // TIMEOUT / BRAIN_UNREACHABLE: outcome unknown
     const status = Number(error.details?.status);
-    // 4xx (except 408 Request Timeout) and 503 Service Unavailable mean "not processed".
-    // 500 / 502 / 504 may have partially or fully processed the request: keep the claim.
-    return (status >= 400 && status < 500 && status !== 408) || status === 503;
+    // Only non-timeout 4xx responses are treated as definite rejection.
+    // Every 5xx (including 503) can be emitted by an intermediary after upstream processing;
+    // keep the claim because the save outcome is not provably absent.
+    return status >= 400 && status < 500 && status !== 408;
   }
 
   private logDedupError(op: string, err: unknown): void {

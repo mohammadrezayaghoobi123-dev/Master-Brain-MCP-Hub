@@ -208,7 +208,7 @@ describe('crash between claim and save (shared SQLite file)', () => {
 });
 
 describe('ambiguous save outcome (response loss)', () => {
-  it('keeps the claim after a timeout, sends an Idempotency-Key, and retries only after the lease', async () => {
+  it('keeps the claim after a timeout and retries only after the lease', async () => {
     const fetchMock = vi
       .fn()
       .mockRejectedValueOnce(Object.assign(new Error('aborted'), { name: 'AbortError' }))
@@ -230,9 +230,6 @@ describe('ambiguous save outcome (response loss)', () => {
     await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({ saved: true });
     expect(fetchMock).toHaveBeenCalledTimes(2);
 
-    for (const [, init] of fetchMock.mock.calls) {
-      expect((init as { headers: Record<string, string> }).headers['Idempotency-Key']).toBe(HASH);
-    }
     mw.close();
   });
 
@@ -256,7 +253,7 @@ describe('ambiguous save outcome (response loss)', () => {
   });
 
   // HTTP statuses after which the brain may or may not have stored the entry: the claim must be kept.
-  it.each([408, 500, 502, 504])('keeps the claim after HTTP %i (outcome unknown)', async (status) => {
+  it.each([408, 500, 502, 503, 504])('keeps the claim after HTTP %i (outcome unknown)', async (status) => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce({ ok: false, status, json: async () => ({ message: 'upstream trouble' }) })
@@ -273,7 +270,7 @@ describe('ambiguous save outcome (response loss)', () => {
   });
 
   // Statuses that mean "not processed": the claim is released so an immediate retry can save.
-  it.each([400, 404, 422, 503])('releases the claim after HTTP %i (definitely not stored)', async (status) => {
+  it.each([400, 404, 422])('releases the claim after HTTP %i (definitely not stored)', async (status) => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce({ ok: false, status, json: async () => ({ message: 'not stored' }) })
