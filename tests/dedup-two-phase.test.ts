@@ -505,7 +505,8 @@ describe('SQLite constructor cleanup', () => {
         requireSqlite: true,
         loadDriver: () => FakeDatabase,
       })
-    ).toThrow('SQLite is required');
+    ).toThrow(/SQLite is required.*synthetic migration failure/);
+    expect(execCalls).toBe(2);
     expect(closed).toBe(true);
   });
 });
