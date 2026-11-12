@@ -188,9 +188,12 @@ export class AutoMemoryMiddleware {
    * otherwise a claim could expire mid-flight and let a second interaction duplicate it.
    */
   private effectiveLeaseMinutes(): number {
-    const brainTimeoutMs = Number(process.env.BRAIN_TIMEOUT_MS) || 30_000;
-    const floorMs = this.config.analysisTimeoutMs + brainTimeoutMs + 1_000;
-    return Math.max(this.config.claimLeaseMinutes * 60_000, floorMs) / 60_000;
+    const finitePositive = (value: unknown, fallback: number): number =>
+      typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback;
+    const brainTimeoutMs = finitePositive(Number(process.env.BRAIN_TIMEOUT_MS), 30_000);
+    const analysisMs = finitePositive(this.config.analysisTimeoutMs, 60_000);
+    const configuredLeaseMs = finitePositive(this.config.claimLeaseMinutes, 2) * 60_000;
+    return Math.max(configuredLeaseMs, analysisMs + brainTimeoutMs + 1_000) / 60_000;
   }
 
   private logDedupError(op: string, err: unknown): void {
