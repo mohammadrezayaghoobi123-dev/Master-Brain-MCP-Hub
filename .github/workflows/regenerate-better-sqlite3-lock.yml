@@ -1,0 +1,78 @@
+name: Regenerate better-sqlite3 lock and verify Node matrix
+
+on:
+  push:
+    branches:
+      - fix/better-sqlite3-node26-2026-11-12
+
+permissions:
+  contents: write
+
+concurrency:
+  group: better-sqlite3-node26-lock-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  regenerate-and-verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout isolated fix branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: true
+
+      - name: Generate lockfile with supported dependency
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          package-manager-cache: false
+
+      - name: Upgrade optional SQLite dependency and regenerate lock
+        run: npm install --save-optional 'better-sqlite3@^12.12.0' --no-audit --no-fund
+
+      - name: Assert resolved SQLite dependency
+        run: |
+          node -e "const p=require('./package-lock.json'); const x=p.packages['node_modules/better-sqlite3']; if (!x || !x.version || !x.version.startsWith('12.')) { console.error('Unexpected better-sqlite3 lock entry:', x); process.exit(1); } console.log('Locked better-sqlite3:', x.version);"
+          npm ls better-sqlite3 --depth=0
+
+      - name: Verify Node 20 install and real SQLite tests
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "20"
+          package-manager-cache: false
+      - run: npm ci --no-audit --no-fund && npm ls better-sqlite3 --depth=0 && DEDUP_REQUIRE_SQLITE=1 npm run test:run
+
+      - name: Verify Node 22 install, tests, typecheck and build
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          package-manager-cache: false
+      - run: |
+          npm ci --no-audit --no-fund
+          npm ls better-sqlite3 --depth=0
+          DEDUP_REQUIRE_SQLITE=1 npm run test:run
+          npm run typecheck
+          npm run build
+
+      - name: Verify Node 24 install and real SQLite tests
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - run: npm ci --no-audit --no-fund && npm ls better-sqlite3 --depth=0 && DEDUP_REQUIRE_SQLITE=1 npm run test:run
+
+      - name: Verify Node 26 install and real SQLite tests
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "26"
+          package-manager-cache: false
+      - run: npm ci --no-audit --no-fund && npm ls better-sqlite3 --depth=0 && DEDUP_REQUIRE_SQLITE=1 npm run test:run
+
+      - name: Commit regenerated manifest and lockfile
+        run: |
+          git diff --check
+          git add package.json package-lock.json
+          git diff --cached --check
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" commit -m "fix(deps): update better-sqlite3 for Node 26 [generated-lock]"
+          git push origin HEAD:refs/heads/fix/better-sqlite3-node26-2026-11-12
