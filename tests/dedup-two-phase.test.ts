@@ -105,13 +105,15 @@ describe.each([
     expect(store.status('h')).toBeNull();
   });
 
-  it('commit with a lost lease returns false but still records the durable save', () => {
+  it('a stale commit cannot overwrite a newer owner's pending reservation', () => {
     const stale = store.claim('h', 1)!;
     advance(MIN + 1);
     const newer = store.claim('h', 1)!; // another interaction took over
     expect(store.commit('h', stale, 30)).toBe(false);
+    expect(store.status('h')).toBe('pending');
+    expect(store.commit('h', newer, 30)).toBe(true);
     expect(store.status('h')).toBe('committed');
-    store.release('h', newer); // must not delete a committed entry
+    store.release('h', newer); // committed entry cannot be released
     expect(store.status('h')).toBe('committed');
   });
 
@@ -269,8 +271,9 @@ describe('ambiguous save outcome (response loss)', () => {
     mw.close();
   });
 
-  // Statuses that mean "not processed": the claim is released so an immediate retry can save.
-  it.each([400, 404, 422])('releases the claim after HTTP %i (definitely not stored)', async (status) => {
+  // The backend contract has no no-side-effects guarantee for HTTP errors.
+  // All HTTP failures remain ambiguous until the claim lease expires.
+  it.each([400, 401, 403, 404, 422, 429])('keeps the claim after HTTP %i (no non-persistence guarantee)', async (status) => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce({ ok: false, status, json: async () => ({ message: 'not stored' }) })
@@ -279,13 +282,17 @@ describe('ambiguous save outcome (response loss)', () => {
     const mw = makeMw(createMemoryDedupStore());
 
     await expect(mw.processInteraction('req', 'res', SRC)).rejects.toBeDefined();
-    await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({ saved: true });
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({
+      saved: false,
+      reason: 'duplicate_in_flight',
+      retryable: true,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
     mw.close();
   });
 });
 
-describe('concurrent identical interactions where the first one fails definitively', () => {
+describe('concurrent identical interactions where the first save response is an HTTP error', () => {
   it('tells the loser it may retry, and the retry is then saved exactly once', async () => {
     let releaseAnalysis!: () => void;
     const gate = new Promise<void>((r) => (releaseAnalysis = r));
@@ -311,8 +318,15 @@ describe('concurrent identical interactions where the first one fails definitive
     releaseAnalysis();
     expect(await first).toEqual({ thrown: 'BRAIN_HTTP_ERROR' });
 
+    await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({
+      saved: false,
+      reason: 'duplicate_in_flight',
+      retryable: true,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    advance(3 * MIN);
     await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({ saved: true });
-    expect(fetchMock).toHaveBeenCalledTimes(2); // one rejected, one stored: a single durable entry
+    expect(fetchMock).toHaveBeenCalledTimes(2);
     mw.close();
   });
 });

@@ -78,10 +78,26 @@ class MemoryDedupStore implements DedupStore {
   }
 
   commit(hash: string, token: string, ttlMinutes: number): boolean {
-    const e = this.entries.get(hash);
-    const owned = e !== undefined && e.state === 'pending' && e.owner === token;
-    this.entries.set(hash, { exp: Date.now() + ttlMinutes * 60_000, state: 'committed', owner: null });
-    return owned;
+    const e = this.live(hash);
+    if (e?.state === 'pending' && e.owner === token) {
+      this.entries.set(hash, {
+        exp: Date.now() + ttlMinutes * 60_000,
+        state: 'committed',
+        owner: null,
+      });
+      return true;
+    }
+
+    // A stale owner must never overwrite a newer pending reservation.
+    // If the row expired and no successor claimed it, record the durable save.
+    if (!e) {
+      this.entries.set(hash, {
+        exp: Date.now() + ttlMinutes * 60_000,
+        state: 'committed',
+        owner: null,
+      });
+    }
+    return false;
   }
 
   release(hash: string, token: string): void {
@@ -186,7 +202,14 @@ class SqliteDedupStore implements DedupStore {
       )
       .run(Date.now() + ttlMinutes * 60_000, hash, token);
     if (result.changes === 1) return true;
-    this.add(hash, ttlMinutes); // lease was lost, but the save is durable: still record it
+
+    // INSERT OR IGNORE records a durable save only when no live row exists.
+    // In particular, it cannot replace a newer owner's pending reservation.
+    this.db
+      .prepare(
+        "INSERT OR IGNORE INTO content_hashes(hash, expires_at, state, owner) VALUES(?, ?, 'committed', NULL)"
+      )
+      .run(hash, Date.now() + ttlMinutes * 60_000);
     return false;
   }
 

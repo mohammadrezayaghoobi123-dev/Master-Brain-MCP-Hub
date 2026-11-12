@@ -233,7 +233,7 @@ describe('AutoMemoryMiddleware reservation recovery', () => {
     }
   });
 
-  it('releases dedup and session reservations after brain save failure', async () => {
+  it('retains the dedup claim after an HTTP save failure without a backend non-persistence guarantee', async () => {
     const dedup = memoryDedup();
     const mw = new AutoMemoryMiddleware(
       { enabled: true, minConfidence: 0.7, maxEntriesPerSession: 1 },
@@ -269,11 +269,15 @@ describe('AutoMemoryMiddleware reservation recovery', () => {
       await expect(mw.processInteraction('save retry request', 'save retry response', {
         tool: 'manual',
         session_id: 'save-recovery-session',
-      })).resolves.toMatchObject({ saved: true });
+      })).resolves.toMatchObject({
+        saved: false,
+        reason: 'duplicate_in_flight',
+        retryable: true,
+      });
 
-      expect(analyze).toHaveBeenCalledTimes(2);
-      expect(global.fetch).toHaveBeenCalledTimes(2);
-      expect(mw.getStatus().sessionCounts['save-recovery-session']).toBe(1);
+      expect(analyze).toHaveBeenCalledTimes(1);
+      expect(global.fetch).toHaveBeenCalledTimes(1);
+      expect(mw.getStatus().sessionCounts['save-recovery-session']).toBeUndefined();
     } finally {
       mw.close();
       _resetBrainClientForTests();
