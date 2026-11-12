@@ -1,0 +1,53 @@
+# TEMPORARY (throwaway branch only; never merge): regenerate package-lock.json with real npm,
+# push it to this branch, then verify on Node 22/24/26.
+name: probe-lock
+on:
+  push:
+    branches:
+      - tmp/lock-probe-3
+permissions:
+  contents: write
+jobs:
+  regen:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "26"
+          package-manager-cache: false
+      - run: |
+          set -eu
+          node -v; npm -v
+          npm install --package-lock-only --no-audit --no-fund
+          git diff --stat
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package-lock.json
+          git commit -m "probe: regenerate package-lock.json for better-sqlite3 ^13.1.1"
+          git push origin HEAD:tmp/lock-probe-3
+  verify:
+    needs: regen
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [22, 24, 26]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: tmp/lock-probe-3
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ matrix.node-version }}
+          package-manager-cache: false
+      - run: npm ci --no-audit --no-fund
+      - run: npm ls better-sqlite3
+      - run: npm run typecheck
+      - run: npm run test:run
+        env:
+          DEDUP_REQUIRE_SQLITE: "1"
+      - run: npm run build
