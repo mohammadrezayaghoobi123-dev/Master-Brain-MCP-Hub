@@ -8,6 +8,13 @@ import { join } from 'node:path';
 import { createDedupStore, createMemoryDedupStore } from '../src/lib/dedup-store.js';
 import { contentHash } from '../src/lib/hash.js';
 
+const originalFetch = global.fetch;
+
+afterEach(() => {
+  global.fetch = originalFetch;
+  _resetBrainClientForTests();
+});
+
 // Use the production in-memory implementation so these tests exercise the real two-phase semantics.
 function memoryDedup(): DedupStore {
   return createMemoryDedupStore();
