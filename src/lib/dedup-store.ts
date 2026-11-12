@@ -36,7 +36,7 @@ export interface DedupStore {
   commit(hash: string, token: string, ttlMinutes: number): boolean;
   /** Deletes the entry only if it is still the caller's PENDING reservation. */
   release(hash: string, token: string): void;
-  /** Records a committed entry if free, or promotes only the matching pending owner when a token is supplied. */
+  /** Records a committed entry if free; a token marks post-save recovery and makes durable success authoritative. */
   add(hash: string, ttlMinutes: number, token?: string): void;
   purgeExpired(): number;
   size(): number;
@@ -101,14 +101,14 @@ class MemoryDedupStore implements DedupStore {
 
   add(hash: string, ttlMinutes: number, token?: string): void {
     const current = this.live(hash);
-    // A recovery write may promote its own reservation, but never a successor's.
-    if (current) {
-      if (token && current.state === 'pending' && current.owner === token) {
-        this.entries.set(hash, { exp: Date.now() + ttlMinutes * 60_000, state: 'committed', owner: null });
-      }
-      return;
+    if (current && !token) return;
+
+    // A token is supplied only by the post-save recovery path. The Brain has
+    // already acknowledged persistence, so the committed fact must supersede
+    // a successor lease just as commit() does.
+    if (token || !current) {
+      this.entries.set(hash, { exp: Date.now() + ttlMinutes * 60_000, state: 'committed', owner: null });
     }
-    this.entries.set(hash, { exp: Date.now() + ttlMinutes * 60_000, state: 'committed', owner: null });
   }
 
   purgeExpired(): number {
@@ -232,18 +232,25 @@ class SqliteDedupStore implements DedupStore {
   add(hash: string, ttlMinutes: number, token?: string): void {
     this.purgeExpired();
     const expiresAt = Date.now() + ttlMinutes * 60_000;
-    if (token) {
-      const promoted = this.db
+    if (!token) {
+      this.db
         .prepare(
-          "UPDATE content_hashes SET state = 'committed', owner = NULL, expires_at = ? WHERE hash = ? AND state = 'pending' AND owner = ?"
+          "INSERT OR IGNORE INTO content_hashes(hash, expires_at, state, owner) VALUES(?, ?, 'committed', NULL)"
         )
-        .run(expiresAt, hash, token);
-      if (promoted.changes === 1) return;
+        .run(hash, expiresAt);
+      return;
     }
-    // If the key is free, record the durable save. INSERT OR IGNORE preserves a successor.
+
+    // The token is passed only after a confirmed Brain save. Preserve that
+    // durable fact even if another pending lease has since taken ownership.
     this.db
       .prepare(
-        "INSERT OR IGNORE INTO content_hashes(hash, expires_at, state, owner) VALUES(?, ?, 'committed', NULL)"
+        `INSERT INTO content_hashes(hash, expires_at, state, owner)
+         VALUES(?, ?, 'committed', NULL)
+         ON CONFLICT(hash) DO UPDATE SET
+           expires_at = excluded.expires_at,
+           state = 'committed',
+           owner = NULL`
       )
       .run(hash, expiresAt);
   }
