@@ -407,7 +407,7 @@ describe('AutoMemoryMiddleware concurrent session limits', () => {
 
 
 describe('AutoMemoryMiddleware durable-save recovery', () => {
-  it('preserves the pending lease when claim promotion fails after a durable save', async () => {
+  it('promotes its own claim through owner-aware recovery when commit throws after a durable save', async () => {
     const dedup = memoryDedup();
     const commit = vi.spyOn(dedup, 'commit').mockImplementation(() => {
       throw new Error('temporary dedup store failure');
@@ -446,12 +446,12 @@ describe('AutoMemoryMiddleware durable-save recovery', () => {
       })).resolves.toMatchObject({ saved: true });
 
       expect(commit).toHaveBeenCalledTimes(1);
-      expect(dedup.status(contentHash('durable request\n---\ndurable response'))).toBe('pending');
+      expect(dedup.status(contentHash('durable request\n---\ndurable response'))).toBe('committed');
       expect(mw.getStatus().sessionCounts['durable-save-session']).toBe(1);
       await expect(mw.processInteraction('durable request', 'durable response', {
         tool: 'manual',
         session_id: 'durable-save-session',
-      })).resolves.toMatchObject({ saved: false, reason: 'duplicate_in_flight', retryable: true });
+      })).resolves.toMatchObject({ saved: false, reason: 'duplicate' });
       expect(global.fetch).toHaveBeenCalledTimes(1);
     } finally {
       mw.close();
