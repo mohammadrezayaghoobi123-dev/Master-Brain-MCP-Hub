@@ -1,0 +1,327 @@
+openapi: 3.1.0
+info:
+  title: Master Brain Memory API
+  version: 2.0.0-draft.2
+  summary: Proposed canonical memory-write boundary for Master Brain.
+  description: |
+    PROPOSED — NOT APPROVED — NOT IMPLEMENTED.
+    This contract is an artifact on an isolated architecture branch. It does not
+    assert that the endpoint exists in any deployed backend.
+servers:
+  - url: https://{backend-host}
+    description: Placeholder only; deployment host is not fixed.
+    variables:
+      backend-host:
+        default: backend.example.invalid
+        description: Replace only through an approved environment configuration.
+security:
+  - serviceBearer: []
+paths:
+  /api/v2/memories:
+    post:
+      operationId: createMemory
+      summary: Create one canonical memory idempotently
+      description: |
+        The server derives tenant and principal identity from the authenticated
+        service credential. Request-body identity fields are forbidden.
+        The same Idempotency-Key and same semantic payload replay the committed
+        result. Reusing a key with a different payload returns 422.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: |
+            Random UUID encoded as an RFC 9651 Structured Field String,
+            for example: "8e03978e-40d5-43e8-bc93-6894a57f9324".
+            Stable across retries of this logical API operation. Never use as
+            an authentication credential.
+          schema:
+            type: string
+            pattern: '^"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}"$'
+        - name: X-Request-ID
+          in: header
+          required: false
+          description: Opaque caller correlation identifier; server generates one if absent.
+          schema:
+            type: string
+            minLength: 8
+            maxLength: 128
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateMemoryRequest'
+      responses:
+        '201':
+          description: Memory created; required audit and idempotency result committed atomically.
+          headers:
+            X-Request-ID:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateMemoryResponse'
+        '400':
+          description: Invalid request or missing/invalid idempotency key.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '401':
+          description: Missing, invalid, expired, or unverifiable service identity.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '403':
+          description: Authenticated principal is inactive or lacks required scope/tenant membership.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          description: Same key is still outstanding, or event identity already exists.
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+                minimum: 1
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: Idempotency key was previously used with a different semantic payload.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '429':
+          description: Rate limit exceeded.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          description: Unexpected server error; client must treat ambiguous outcome as UNKNOWN.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '503':
+          description: Identity or persistence dependency unavailable; fail closed.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+components:
+  securitySchemes:
+    serviceBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Proposed service-principal credential. Concrete issuer, audience,
+        signing algorithm, rotation, and revocation policy remain OPEN and
+        require an infrastructure ADR. This is not implemented by this spec.
+  schemas:
+    CreateMemoryRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - schema_version
+        - event_id
+        - type
+        - content
+        - classification
+      properties:
+        schema_version:
+          const: '2.0'
+        event_id:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: Stable producer-scoped logical event identifier; distinct from Idempotency-Key.
+        type:
+          $ref: '#/components/schemas/MemoryType'
+        content:
+          type: string
+          minLength: 1
+          maxLength: 50000
+        summary:
+          type: string
+          maxLength: 2000
+        tags:
+          type: array
+          maxItems: 50
+          items:
+            type: string
+            minLength: 1
+            maxLength: 255
+        refs:
+          type: array
+          maxItems: 50
+          items:
+            type: string
+            minLength: 1
+            maxLength: 2048
+        source:
+          $ref: '#/components/schemas/Source'
+        metadata:
+          type: object
+          additionalProperties: true
+        provenance:
+          $ref: '#/components/schemas/Provenance'
+        classification:
+          type: string
+          enum: [public, internal, confidential, restricted]
+        consent_ref:
+          type: [string, 'null']
+          maxLength: 255
+      not:
+        anyOf:
+          - required: [tenant_id]
+          - required: [principal_id]
+          - required: [owner_id]
+          - required: [user_id]
+      description: |
+        tenant_id, principal_id, owner_id, and authenticated user identity are
+        server-derived and must never be supplied as authoritative body fields.
+    MemoryType:
+      type: string
+      enum:
+        - decision
+        - fix
+        - learning
+        - pattern
+        - preference
+        - config
+        - error
+        - context
+        - conversation
+        - policy
+        - code
+        - note
+        - task
+      description: Union of currently observed Hub and Backend values; no lossy remapping.
+    Source:
+      type: object
+      additionalProperties: false
+      properties:
+        tool:
+          type: string
+          enum: [claude-code, codex, cursor, api, manual, auto-memory]
+        session_id:
+          type: string
+          maxLength: 255
+        project:
+          type: string
+          maxLength: 255
+        file:
+          type: string
+          maxLength: 2048
+      description: Caller-supplied provenance claim, not authenticated identity.
+    Provenance:
+      type: object
+      additionalProperties: true
+      properties:
+        origin:
+          type: string
+          maxLength: 255
+        evidence_refs:
+          type: array
+          items:
+            type: string
+            maxLength: 2048
+    Memory:
+      type: object
+      required:
+        - id
+        - schema_version
+        - tenant_id
+        - type
+        - content
+        - tags
+        - event_id
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        legacy_id:
+          type: [string, 'null']
+        schema_version:
+          const: '2.0'
+        tenant_id:
+          type: string
+        type:
+          $ref: '#/components/schemas/MemoryType'
+        content:
+          type: string
+        summary:
+          type: [string, 'null']
+        tags:
+          type: array
+          items:
+            type: string
+        refs:
+          type: array
+          items:
+            type: string
+        source:
+          type: object
+        metadata:
+          type: object
+        provenance:
+          type: object
+        classification:
+          type: string
+        consent_ref:
+          type: [string, 'null']
+        event_id:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    CreateMemoryResponse:
+      type: object
+      required: [data, request_id, idempotency]
+      properties:
+        data:
+          $ref: '#/components/schemas/Memory'
+        request_id:
+          type: string
+        idempotency:
+          type: object
+          required: [status, replayed]
+          properties:
+            status:
+              const: COMMITTED
+            replayed:
+              type: boolean
+    Problem:
+      type: object
+      required: [type, title, status, code]
+      properties:
+        type:
+          type: string
+          format: uri-reference
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        instance:
+          type: string
+          format: uri-reference
+        code:
+          type: string
+        request_id:
+          type: string
