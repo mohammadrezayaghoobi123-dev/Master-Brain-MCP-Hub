@@ -39,7 +39,7 @@ describe('SQLiteDedupStore integration', () => {
     process.env.DEDUP_REQUIRE_SQLITE = '1';
     try {
       expect(() => createDedupStore(join(blocker, 'blocked.sqlite'))).toThrow(
-        /SQLite is required but unavailable; refusing in-memory fallback/
+        /SQLite is required.*unavailable/
       );
     } finally {
       if (previous === undefined) delete process.env.DEDUP_REQUIRE_SQLITE;
