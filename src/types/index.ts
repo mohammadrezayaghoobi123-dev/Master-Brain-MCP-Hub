@@ -67,6 +67,10 @@ export interface AutoMemoryConfig {
   maxEntriesPerSession: number;
   /** Minutes retained for content-hash deduplication (persistent store). */
   deduplicationWindowMinutes: number;
+  /** Minutes a pending dedup claim is held before it expires (raised to cover analysis + save time). */
+  claimLeaseMinutes: number;
+  /** Hard limit for one importance-analysis call. */
+  analysisTimeoutMs: number;
   /** Anthropic model id used for importance analysis. */
   analysisModel: string;
 }
