@@ -28,8 +28,19 @@ const analysisSchema = z.object({
   context: z.string().max(500).optional(),
 });
 
+const MAX_NODE_TIMEOUT_MS = 2_147_483_647;
+
 function finitePositiveTimeout(value: unknown, fallback: number): number {
-  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback;
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 && value <= MAX_NODE_TIMEOUT_MS
+    ? value
+    : fallback;
+}
+
+function finitePositiveLeaseMinutes(value: unknown, fallback: number): number {
+  const maxMinutes = (Number.MAX_SAFE_INTEGER - Date.now()) / 60_000;
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 && value <= maxMinutes
+    ? value
+    : fallback;
 }
 
 const DEFAULT_CONFIG: AutoMemoryConfig = {
@@ -198,7 +209,7 @@ export class AutoMemoryMiddleware {
   private effectiveLeaseMinutes(): number {
     const brainTimeoutMs = finitePositiveTimeout(Number(process.env.BRAIN_TIMEOUT_MS), 30_000);
     const analysisMs = finitePositiveTimeout(this.config.analysisTimeoutMs, DEFAULT_CONFIG.analysisTimeoutMs);
-    const configuredLeaseMs = finitePositiveTimeout(this.config.claimLeaseMinutes, 2) * 60_000;
+    const configuredLeaseMs = finitePositiveLeaseMinutes(this.config.claimLeaseMinutes, 2) * 60_000;
     return Math.max(configuredLeaseMs, analysisMs + brainTimeoutMs + 1_000) / 60_000;
   }
 
