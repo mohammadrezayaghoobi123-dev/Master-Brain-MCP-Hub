@@ -159,7 +159,8 @@ The backend is authoritative. Hub-local SQLite/Map deduplication may reduce dupl
 | Same key, same fingerprint, prior commit | original status | Replay original response; no second memory |
 | Same key, different fingerprint | 422 | Reject; preserve original result |
 | Same key while first transaction is outstanding | 409 or bounded wait then replay | No second write; include retry guidance |
-| Same event_id under another key | 409 or deterministic existing-event response | Never create second logical event |
+| Same event_id + same fingerprint under another key | 200 | Return the existing memory; bind/store this key's replay result; never create another memory |
+| Same event_id + different fingerprint under another key | 409 | Return EVENT_ID_REUSED; preserve the original event and memory |
 | Auth missing/invalid/expired | 401 | No data access |
 | Authenticated but unauthorized | 403 | No data access |
 | DB/identity dependency unavailable | 503 | Fail closed; client treats write outcome as UNKNOWN if commit may have occurred |
