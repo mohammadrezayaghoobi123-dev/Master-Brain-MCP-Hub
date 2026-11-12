@@ -53,6 +53,12 @@ paths:
             schema:
               $ref: '#/components/schemas/CreateMemoryRequest'
       responses:
+        '200':
+          description: Existing logical event returned for a new idempotency key with the same fingerprint; no second memory is created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateMemoryResponse'
         '201':
           description: Memory created; required audit and idempotency result committed atomically.
           headers:
@@ -82,7 +88,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Problem'
         '409':
-          description: Same key is still outstanding, or event identity already exists.
+          description: Same key is still outstanding, or the same event ID was reused with a different fingerprint.
           headers:
             Retry-After:
               schema:
