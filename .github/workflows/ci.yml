@@ -40,7 +40,10 @@ jobs:
       - name: Type check
         run: npm run typecheck
 
+      # Fail closed: the dedup tests must run against real SQLite, never the in-memory fallback.
       - name: Unit tests
+        env:
+          DEDUP_REQUIRE_SQLITE: "1"
         run: npm run test:run
 
       - name: Build
