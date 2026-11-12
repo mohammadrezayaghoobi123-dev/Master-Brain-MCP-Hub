@@ -105,16 +105,15 @@ describe.each([
     expect(store.status('h')).toBeNull();
   });
 
-  it("a stale commit cannot overwrite a newer owner's pending reservation", () => {
+  it('a confirmed stale save supersedes a successor lease and remains committed if that successor releases', () => {
     const stale = store.claim('h', 1)!;
     advance(MIN + 1);
-    const newer = store.claim('h', 1)!; // another interaction took over
-    expect(store.commit('h', stale, 30)).toBe(false);
-    expect(store.status('h')).toBe('pending');
-    expect(store.commit('h', newer, 30)).toBe(true);
+    const successor = store.claim('h', 5)!;
+    expect(store.commit('h', stale, 30)).toBe(false); // caller lost lease ownership
+    expect(store.status('h')).toBe('committed'); // but the backend save was confirmed
+    store.release('h', successor); // successor failed before saving
     expect(store.status('h')).toBe('committed');
-    store.release('h', newer); // committed entry cannot be released
-    expect(store.status('h')).toBe('committed');
+    expect(store.claim('h', 1)).toBeNull();
   });
 
   it('records a stale durable save after lease expiry when no successor owns the key', () => {
@@ -154,13 +153,13 @@ describe.each([
     expect(store.status('h')).toBe('committed');
   });
 
-  it('add with a stale owner token cannot overwrite a successor reservation', () => {
+  it('owner-aware post-save recovery records committed even after a successor lease starts', () => {
     const stale = store.claim('h', 1)!;
     advance(MIN + 1);
     const successor = store.claim('h', 5)!;
     store.add('h', 30, stale);
-    expect(store.status('h')).toBe('pending');
-    expect(store.commit('h', successor, 30)).toBe(true);
+    expect(store.status('h')).toBe('committed');
+    store.release('h', successor);
     expect(store.status('h')).toBe('committed');
   });
 
