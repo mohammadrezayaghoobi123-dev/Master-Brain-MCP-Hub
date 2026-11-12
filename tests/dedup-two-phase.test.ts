@@ -369,3 +369,32 @@ describe('observability', () => {
     sqlite.close();
   });
 });
+
+describe('SQLite unavailable (controlled)', () => {
+  const failingLoader = () => {
+    throw Object.assign(new Error("Cannot find module 'better-sqlite3'"), { code: 'MODULE_NOT_FOUND' });
+  };
+
+  it('falls back to memory by default, and says so via backend', () => {
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const store = createDedupStore(':memory:', { requireSqlite: false, loadDriver: failingLoader });
+    expect(store.backend).toBe('memory');
+    expect(spy).toHaveBeenCalled();
+    store.close();
+  });
+
+  it('fails closed when SQLite is required', () => {
+    expect(() => createDedupStore(':memory:', { requireSqlite: true, loadDriver: failingLoader })).toThrow(
+      'SQLite is required'
+    );
+  });
+
+  it('fails closed when DEDUP_REQUIRE_SQLITE=1 is set', () => {
+    process.env.DEDUP_REQUIRE_SQLITE = '1';
+    try {
+      expect(() => createDedupStore(':memory:', { loadDriver: failingLoader })).toThrow('SQLite is required');
+    } finally {
+      delete process.env.DEDUP_REQUIRE_SQLITE;
+    }
+  });
+});

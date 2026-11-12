@@ -119,9 +119,8 @@ class SqliteDedupStore implements DedupStore {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private db: any;
 
-  constructor(dbPath: string) {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const Database = require('better-sqlite3') as new (
+  constructor(dbPath: string, loadDriver: () => unknown = () => require('better-sqlite3')) {
+    const Database = loadDriver() as new (
       path: string,
       opts?: { readonly?: boolean }
     ) => {
@@ -230,15 +229,34 @@ export function createMemoryDedupStore(): DedupStore {
   return new MemoryDedupStore();
 }
 
-export function createDedupStore(explicitPath?: string): DedupStore {
+export interface CreateDedupStoreOptions {
+  /**
+   * Fail closed: throw instead of falling back to the in-memory store when SQLite is unavailable.
+   * Defaults to env DEDUP_REQUIRE_SQLITE=1|true. The in-memory store gives NO cross-process or
+   * restart-surviving deduplication, so environments that rely on it must opt in to being strict.
+   */
+  requireSqlite?: boolean;
+  /** Test seam: replaces `require('better-sqlite3')`. */
+  loadDriver?: () => unknown;
+}
+
+export function createDedupStore(explicitPath?: string, options: CreateDedupStoreOptions = {}): DedupStore {
+  const requireSqlite =
+    options.requireSqlite ?? ['1', 'true'].includes((process.env.DEDUP_REQUIRE_SQLITE ?? '').toLowerCase());
   const path =
     explicitPath ||
     process.env.DEDUP_DB_PATH ||
     join(process.env.DATA_DIR || process.cwd(), '.data', 'auto-memory-dedup.sqlite');
 
   try {
-    return new SqliteDedupStore(path);
+    return new SqliteDedupStore(path, options.loadDriver);
   } catch (err) {
+    if (requireSqlite) {
+      throw new Error(
+        `[DedupStore] SQLite is required (DEDUP_REQUIRE_SQLITE) but unavailable: ${err instanceof Error ? err.message : String(err)}`,
+        { cause: err }
+      );
+    }
     console.error(
       '[DedupStore] SQLite unavailable, using in-memory fallback (no cross-process dedup):',
       err instanceof Error ? err.message : err
