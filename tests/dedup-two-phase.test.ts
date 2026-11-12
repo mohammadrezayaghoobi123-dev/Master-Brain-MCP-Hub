@@ -374,7 +374,9 @@ describe('SQLite unavailable (controlled)', () => {
 
   it('falls back to memory outside production when explicitly allowed, and reports its backend', () => {
     const previousNodeEnv = process.env.NODE_ENV;
+    const previousRequireSqlite = process.env.DEDUP_REQUIRE_SQLITE;
     process.env.NODE_ENV = 'test';
+    delete process.env.DEDUP_REQUIRE_SQLITE;
     try {
       const spy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
       const store = createDedupStore(':memory:', { requireSqlite: false, loadDriver: failingLoader });
@@ -384,6 +386,8 @@ describe('SQLite unavailable (controlled)', () => {
     } finally {
       if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
       else process.env.NODE_ENV = previousNodeEnv;
+      if (previousRequireSqlite === undefined) delete process.env.DEDUP_REQUIRE_SQLITE;
+      else process.env.DEDUP_REQUIRE_SQLITE = previousRequireSqlite;
     }
   });
 
