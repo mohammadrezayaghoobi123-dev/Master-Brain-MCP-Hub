@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { BrainClient } from '../src/brain/client.js';
+import { BrainClient, _resetBrainClientForTests } from '../src/brain/client.js';
+import { AutoMemoryMiddleware } from '../src/middleware/auto-memory.js';
+import { createMemoryDedupStore } from '../src/lib/dedup-store.js';
 import { AppError } from '../src/lib/errors.js';
 
 describe('BrainClient', () => {
@@ -144,6 +146,61 @@ describe('timeout upper-bound validation', () => {
       } finally {
         global.fetch = originalFetch;
         timerSpy.mockRestore();
+      }
+    }
+  );
+});
+
+
+describe('Auto-Memory timeout upper-bound validation', () => {
+  it.each([2_147_483_648, Number.MAX_VALUE])(
+    'uses the 60-second default when analysis timeout exceeds Node timer maximum (%s)',
+    async (analysisTimeoutMs) => {
+      const originalFetch = global.fetch;
+      _resetBrainClientForTests();
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 201,
+        json: async () => ({
+          id: 'entry-1',
+          type: 'decision',
+          content: 'A durable decision',
+          tags: ['timeout'],
+          timestamp: new Date().toISOString(),
+          source: { tool: 'manual' },
+        }),
+      }) as unknown as typeof fetch;
+
+      const mw = new AutoMemoryMiddleware(
+        { enabled: true, analysisTimeoutMs },
+        createMemoryDedupStore()
+      );
+      const create = vi.fn().mockResolvedValue({
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            isImportant: true,
+            type: 'decision',
+            summary: 'A durable decision',
+            tags: ['timeout'],
+            confidence: 1,
+          }),
+        }],
+      });
+      vi.spyOn(mw as any, 'getAnthropic').mockReturnValue({ messages: { create } } as any);
+
+      try {
+        await expect(
+          mw.processInteraction('request', 'response', { tool: 'manual', session_id: 'timeout-boundary' })
+        ).resolves.toMatchObject({ saved: true });
+        expect(create).toHaveBeenCalledWith(
+          expect.any(Object),
+          expect.objectContaining({ timeout: 60_000, maxRetries: 0 })
+        );
+      } finally {
+        mw.close();
+        global.fetch = originalFetch;
+        _resetBrainClientForTests();
       }
     }
   );
