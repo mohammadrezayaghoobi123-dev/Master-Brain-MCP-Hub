@@ -28,6 +28,10 @@ const analysisSchema = z.object({
   context: z.string().max(500).optional(),
 });
 
+function finitePositiveTimeout(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
 const DEFAULT_CONFIG: AutoMemoryConfig = {
   enabled: true,
   minConfidence: 0.7,
@@ -51,6 +55,10 @@ export class AutoMemoryMiddleware {
 
   constructor(config: Partial<AutoMemoryConfig> = {}, dedup?: DedupStore) {
     this.config = { ...DEFAULT_CONFIG, ...config };
+    this.config.analysisTimeoutMs = finitePositiveTimeout(
+      this.config.analysisTimeoutMs,
+      DEFAULT_CONFIG.analysisTimeoutMs
+    );
     this.dedup = dedup ?? createDedupStore();
 
     this.purgeTimer = setInterval(() => {
@@ -188,11 +196,9 @@ export class AutoMemoryMiddleware {
    * otherwise a claim could expire mid-flight and let a second interaction duplicate it.
    */
   private effectiveLeaseMinutes(): number {
-    const finitePositive = (value: unknown, fallback: number): number =>
-      typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback;
-    const brainTimeoutMs = finitePositive(Number(process.env.BRAIN_TIMEOUT_MS), 30_000);
-    const analysisMs = finitePositive(this.config.analysisTimeoutMs, 60_000);
-    const configuredLeaseMs = finitePositive(this.config.claimLeaseMinutes, 2) * 60_000;
+    const brainTimeoutMs = finitePositiveTimeout(Number(process.env.BRAIN_TIMEOUT_MS), 30_000);
+    const analysisMs = finitePositiveTimeout(this.config.analysisTimeoutMs, DEFAULT_CONFIG.analysisTimeoutMs);
+    const configuredLeaseMs = finitePositiveTimeout(this.config.claimLeaseMinutes, 2) * 60_000;
     return Math.max(configuredLeaseMs, analysisMs + brainTimeoutMs + 1_000) / 60_000;
   }
 
@@ -274,7 +280,14 @@ export class AutoMemoryMiddleware {
     if (config.maxEntriesPerSession !== undefined) {
       config.maxEntriesPerSession = Math.max(1, Math.floor(Number(config.maxEntriesPerSession)));
     }
-    this.config = { ...this.config, ...config };
+    const normalized = { ...config };
+    if (normalized.analysisTimeoutMs !== undefined) {
+      normalized.analysisTimeoutMs = finitePositiveTimeout(
+        normalized.analysisTimeoutMs,
+        DEFAULT_CONFIG.analysisTimeoutMs
+      );
+    }
+    this.config = { ...this.config, ...normalized };
   }
 
   getStatus(): {
