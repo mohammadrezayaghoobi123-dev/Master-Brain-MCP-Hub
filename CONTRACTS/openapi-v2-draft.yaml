@@ -135,6 +135,7 @@ components:
         - event_id
         - type
         - content
+        - source
         - classification
       properties:
         schema_version:
@@ -152,7 +153,7 @@ components:
           maxLength: 50000
         summary:
           type: string
-          maxLength: 2000
+          maxLength: 200
         tags:
           type: array
           maxItems: 50
@@ -176,7 +177,9 @@ components:
           $ref: '#/components/schemas/Provenance'
         classification:
           type: string
-          enum: [public, internal, confidential, restricted]
+          minLength: 1
+          maxLength: 64
+          description: Classification vocabulary requires a separate approved policy; no unapproved enum is imposed here.
         consent_ref:
           type: [string, 'null']
           maxLength: 255
@@ -209,6 +212,7 @@ components:
     Source:
       type: object
       additionalProperties: false
+      required: [tool]
       properties:
         tool:
           type: string
