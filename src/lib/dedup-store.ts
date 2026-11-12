@@ -232,8 +232,8 @@ export function createMemoryDedupStore(): DedupStore {
 export interface CreateDedupStoreOptions {
   /**
    * Fail closed: throw instead of falling back to the in-memory store when SQLite is unavailable.
-   * Defaults to env DEDUP_REQUIRE_SQLITE=1|true. The in-memory store gives NO cross-process or
-   * restart-surviving deduplication, so environments that rely on it must opt in to being strict.
+   * Required in NODE_ENV=production, or when DEDUP_REQUIRE_SQLITE=1|true. Production cannot
+   * override this with requireSqlite:false. The in-memory store has no cross-process or restart persistence.
    */
   requireSqlite?: boolean;
   /** Test seam: replaces `require('better-sqlite3')`. */
@@ -242,9 +242,9 @@ export interface CreateDedupStoreOptions {
 
 export function createDedupStore(explicitPath?: string, options: CreateDedupStoreOptions = {}): DedupStore {
   const requireSqlite =
-    options.requireSqlite ??
-    (['1', 'true'].includes((process.env.DEDUP_REQUIRE_SQLITE ?? '').toLowerCase()) ||
-      process.env.NODE_ENV === 'production');
+    process.env.NODE_ENV === 'production' ||
+    options.requireSqlite === true ||
+    ['1', 'true'].includes((process.env.DEDUP_REQUIRE_SQLITE ?? '').toLowerCase());
   const path =
     explicitPath ||
     process.env.DEDUP_DB_PATH ||
@@ -255,7 +255,7 @@ export function createDedupStore(explicitPath?: string, options: CreateDedupStor
   } catch (err) {
     if (requireSqlite) {
       throw new Error(
-        `[DedupStore] SQLite is required (DEDUP_REQUIRE_SQLITE) but unavailable: ${err instanceof Error ? err.message : String(err)}`,
+        `[DedupStore] SQLite is required (production or DEDUP_REQUIRE_SQLITE) but unavailable: ${err instanceof Error ? err.message : String(err)}`,
         { cause: err }
       );
     }

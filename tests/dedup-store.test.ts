@@ -58,7 +58,7 @@ describe('SQLiteDedupStore integration', () => {
     process.env.NODE_ENV = 'production';
     process.env.DEDUP_REQUIRE_SQLITE = '0';
     try {
-      expect(() => createDedupStore(join(blocker, 'blocked.sqlite'))).toThrow(
+      expect(() => createDedupStore(join(blocker, 'blocked.sqlite'), { requireSqlite: false })).toThrow(
         /SQLite is required/
       );
     } finally {
