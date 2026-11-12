@@ -566,3 +566,49 @@ describe('SQLite unavailable (controlled)', () => {
     }
   });
 });
+
+describe('Auto-Memory analysis timeout validation', () => {
+  it.each([Number.NaN, Number.POSITIVE_INFINITY, 0, -1])(
+    'passes a finite positive timeout to the Anthropic SDK for invalid config %s',
+    async (analysisTimeoutMs) => {
+      const fetchMock = vi.fn().mockResolvedValue(okResponse());
+      global.fetch = fetchMock as unknown as typeof fetch;
+      const mw = makeMw(createMemoryDedupStore(), { analysisTimeoutMs });
+      const create = vi.fn().mockResolvedValue({
+        content: [{ type: 'text', text: JSON.stringify(analysis) }],
+      });
+      vi.spyOn(mw as any, 'getAnthropic').mockReturnValue({ messages: { create } });
+
+      try {
+        await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({ saved: true });
+        expect(create).toHaveBeenCalledWith(
+          expect.any(Object),
+          expect.objectContaining({ timeout: 60_000, maxRetries: 0 })
+        );
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+      } finally {
+        mw.close();
+      }
+    }
+  );
+
+  it('normalizes an invalid timeout supplied through updateConfig before the next analysis', async () => {
+    global.fetch = vi.fn().mockResolvedValue(okResponse()) as unknown as typeof fetch;
+    const mw = makeMw(createMemoryDedupStore());
+    const create = vi.fn().mockResolvedValue({
+      content: [{ type: 'text', text: JSON.stringify(analysis) }],
+    });
+    vi.spyOn(mw as any, 'getAnthropic').mockReturnValue({ messages: { create } });
+    mw.updateConfig({ analysisTimeoutMs: Number.POSITIVE_INFINITY });
+
+    try {
+      await mw.processInteraction('req', 'res', SRC);
+      expect(create).toHaveBeenCalledWith(
+        expect.any(Object),
+        expect.objectContaining({ timeout: 60_000, maxRetries: 0 })
+      );
+    } finally {
+      mw.close();
+    }
+  });
+});
