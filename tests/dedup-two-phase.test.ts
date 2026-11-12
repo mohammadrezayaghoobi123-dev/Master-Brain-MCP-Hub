@@ -266,6 +266,40 @@ describe('ambiguous save outcome (response loss)', () => {
     mw.close();
   });
 
+  it('documents the unresolved duplicate-write risk after a save commits but its response is lost', async () => {
+    // Simulate a backend that commits the first POST, then the network drops
+    // the response. The Hub cannot distinguish this from a request that never
+    // reached the backend. After the pending lease expires it retries; without
+    // a server-side idempotency key, the backend can persist the same entry twice.
+    const backendWrites: string[] = [];
+    const fetchMock = vi.fn()
+      .mockImplementationOnce(async (_url: string, init: RequestInit) => {
+        backendWrites.push(String(init.body));
+        throw new Error('connection reset after backend commit');
+      })
+      .mockImplementationOnce(async (_url: string, init: RequestInit) => {
+        backendWrites.push(String(init.body));
+        return okResponse();
+      });
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const mw = makeMw(createMemoryDedupStore());
+
+    await expect(mw.processInteraction('req', 'res', SRC)).rejects.toBeDefined();
+    await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({
+      saved: false,
+      reason: 'duplicate_in_flight',
+      retryable: true,
+    });
+    expect(backendWrites).toHaveLength(1);
+
+    advance(3 * MIN);
+    await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({ saved: true });
+    expect(backendWrites).toHaveLength(2);
+    expect(backendWrites[0]).toBe(backendWrites[1]);
+
+    mw.close();
+  });
+
   it('treats a 2xx response with an unreadable body as ambiguous, not as a failed save', async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
@@ -324,7 +358,7 @@ describe('ambiguous save outcome (response loss)', () => {
 });
 
 describe('concurrent identical interactions where the first save response is an HTTP error', () => {
-  it('tells the loser it may retry, and the retry is then saved exactly once', async () => {
+  it('tells the loser it may retry; this client-side test does not prove backend exactly-once', async () => {
     let releaseAnalysis!: () => void;
     const gate = new Promise<void>((r) => (releaseAnalysis = r));
     const fetchMock = vi
