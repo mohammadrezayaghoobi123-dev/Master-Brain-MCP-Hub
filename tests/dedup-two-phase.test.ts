@@ -487,6 +487,45 @@ describe('SQLite multi-process atomicity', () => {
   });
 });
 
+describe('SQLite constructor cleanup', () => {
+  it('closes the native handle when schema migration fails after open', () => {
+    let execCalls = 0;
+    let closed = false;
+    class FakeDatabase {
+      exec() {
+        execCalls += 1;
+        if (execCalls === 2) throw new Error('synthetic migration failure');
+      }
+      close() {
+        closed = true;
+      }
+    }
+    expect(() =>
+      createDedupStore(dbPath, {
+        requireSqlite: true,
+        loadDriver: () => FakeDatabase,
+      })
+    ).toThrow('SQLite is required');
+    expect(closed).toBe(true);
+  });
+});
+
+describe('lease configuration validation', () => {
+  it('uses finite positive defaults when lease or timeout configuration is invalid', () => {
+    const mw = makeMw(createMemoryDedupStore(), {
+      claimLeaseMinutes: Number.NaN,
+      analysisTimeoutMs: Number.POSITIVE_INFINITY,
+    });
+    try {
+      const lease = (mw as any).effectiveLeaseMinutes();
+      expect(Number.isFinite(lease)).toBe(true);
+      expect(lease).toBeGreaterThan(0);
+    } finally {
+      mw.close();
+    }
+  });
+});
+
 describe('SQLite unavailable (controlled)', () => {
   const failingLoader = () => {
     throw Object.assign(new Error("Cannot find module 'better-sqlite3'"), { code: 'MODULE_NOT_FOUND' });
