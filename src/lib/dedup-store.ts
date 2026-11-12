@@ -35,7 +35,7 @@ export interface DedupStore {
   commit(hash: string, token: string, ttlMinutes: number): boolean;
   /** Deletes the entry only if it is still the caller's PENDING reservation. */
   release(hash: string, token: string): void;
-  /** Upserts a committed entry. */
+  /** Records a committed entry only when no live entry exists; never overwrites a pending owner. */
   add(hash: string, ttlMinutes: number): void;
   purgeExpired(): number;
   size(): number;
@@ -106,6 +106,8 @@ class MemoryDedupStore implements DedupStore {
   }
 
   add(hash: string, ttlMinutes: number): void {
+    // Recovery writes must not replace a live pending reservation owned by another interaction.
+    if (this.live(hash)) return;
     this.entries.set(hash, { exp: Date.now() + ttlMinutes * 60_000, state: 'committed', owner: null });
   }
 
@@ -221,10 +223,11 @@ class SqliteDedupStore implements DedupStore {
   }
 
   add(hash: string, ttlMinutes: number): void {
+    // Recovery writes must not replace a live pending reservation owned by another interaction.
+    this.purgeExpired();
     this.db
       .prepare(
-        `INSERT INTO content_hashes(hash, expires_at, state, owner) VALUES(?, ?, 'committed', NULL)
-         ON CONFLICT(hash) DO UPDATE SET expires_at = excluded.expires_at, state = 'committed', owner = NULL`
+        "INSERT OR IGNORE INTO content_hashes(hash, expires_at, state, owner) VALUES(?, ?, 'committed', NULL)"
       )
       .run(hash, Date.now() + ttlMinutes * 60_000);
   }

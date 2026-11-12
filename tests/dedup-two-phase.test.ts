@@ -142,10 +142,18 @@ describe.each([
     expect(store.status('h')).toBe('committed');
   });
 
-  it('add upserts a committed entry', () => {
+  it('add records a committed entry when the key is free', () => {
     store.add('h', 30);
     expect(store.status('h')).toBe('committed');
     expect(store.claim('h', 1)).toBeNull();
+  });
+
+  it('add cannot overwrite a live pending reservation', () => {
+    const owner = store.claim('h', 5)!;
+    store.add('h', 30);
+    expect(store.status('h')).toBe('pending');
+    expect(store.commit('h', owner, 30)).toBe(true);
+    expect(store.status('h')).toBe('committed');
   });
 });
 
