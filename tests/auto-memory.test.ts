@@ -233,7 +233,7 @@ describe('AutoMemoryMiddleware reservation recovery', () => {
     }
   });
 
-  it('releases dedup and session reservations after brain save failure', async () => {
+  it('retains the dedup claim after an HTTP save failure without a backend non-persistence guarantee', async () => {
     const dedup = memoryDedup();
     const mw = new AutoMemoryMiddleware(
       { enabled: true, minConfidence: 0.7, maxEntriesPerSession: 1 },
@@ -244,8 +244,8 @@ describe('AutoMemoryMiddleware reservation recovery', () => {
     global.fetch = vi.fn()
       .mockResolvedValueOnce({
         ok: false,
-        status: 503,
-        json: async () => ({ message: 'temporary backend failure' }),
+        status: 400,
+        json: async () => ({ message: 'definitive backend rejection' }),
       })
       .mockResolvedValueOnce({
         ok: true,
@@ -264,16 +264,20 @@ describe('AutoMemoryMiddleware reservation recovery', () => {
       await expect(mw.processInteraction('save retry request', 'save retry response', {
         tool: 'manual',
         session_id: 'save-recovery-session',
-      })).rejects.toThrow('temporary backend failure');
+      })).rejects.toThrow('definitive backend rejection');
 
       await expect(mw.processInteraction('save retry request', 'save retry response', {
         tool: 'manual',
         session_id: 'save-recovery-session',
-      })).resolves.toMatchObject({ saved: true });
+      })).resolves.toMatchObject({
+        saved: false,
+        reason: 'duplicate_in_flight',
+        retryable: true,
+      });
 
-      expect(analyze).toHaveBeenCalledTimes(2);
-      expect(global.fetch).toHaveBeenCalledTimes(2);
-      expect(mw.getStatus().sessionCounts['save-recovery-session']).toBe(1);
+      expect(analyze).toHaveBeenCalledTimes(1);
+      expect(global.fetch).toHaveBeenCalledTimes(1);
+      expect(mw.getStatus().sessionCounts['save-recovery-session']).toBeUndefined();
     } finally {
       mw.close();
       _resetBrainClientForTests();
@@ -403,7 +407,7 @@ describe('AutoMemoryMiddleware concurrent session limits', () => {
 
 
 describe('AutoMemoryMiddleware durable-save recovery', () => {
-  it('still records a committed entry when promoting the claim fails after save', async () => {
+  it('promotes its own claim through owner-aware recovery when commit throws after a durable save', async () => {
     const dedup = memoryDedup();
     const commit = vi.spyOn(dedup, 'commit').mockImplementation(() => {
       throw new Error('temporary dedup store failure');
