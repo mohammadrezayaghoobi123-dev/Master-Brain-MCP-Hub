@@ -105,7 +105,7 @@ describe.each([
     expect(store.status('h')).toBeNull();
   });
 
-  it('a stale commit cannot overwrite a newer owner's pending reservation', () => {
+  it("a stale commit cannot overwrite a newer owner's pending reservation", () => {
     const stale = store.claim('h', 1)!;
     advance(MIN + 1);
     const newer = store.claim('h', 1)!; // another interaction took over
