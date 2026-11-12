@@ -34,6 +34,8 @@ const DEFAULT_CONFIG: AutoMemoryConfig = {
   excludeTypes: [],
   maxEntriesPerSession: 50,
   deduplicationWindowMinutes: 30,
+  claimLeaseMinutes: 2,
+  analysisTimeoutMs: 60_000,
   analysisModel: process.env.AUTO_MEMORY_MODEL || 'claude-3-5-haiku-20241022',
 };
 
@@ -80,7 +82,7 @@ export class AutoMemoryMiddleware {
     request: string,
     response: string,
     source: MemorySource
-  ): Promise<{ saved: boolean; entry?: AnalysisResult; reason?: string }> {
+  ): Promise<{ saved: boolean; entry?: AnalysisResult; reason?: string; retryable?: boolean }> {
     if (!this.config.enabled) {
       return { saved: false, reason: 'disabled' };
     }
@@ -96,13 +98,20 @@ export class AutoMemoryMiddleware {
     // middleware instance, including across async analysis/save boundaries.
     this.sessionReservations.set(sessionKey, reserved + 1);
     const hash = contentHash(request + '\n---\n' + response);
-    let reservationToken: number | null = null;
+    let reservationToken: string | null = null;
     let persisted = false;
+    // Once the save request may have reached the brain its outcome is unknown:
+    // the pending claim is then kept until its lease expires instead of released.
+    let keepClaim = false;
 
     try {
-      reservationToken = this.dedup.claim(hash, this.config.deduplicationWindowMinutes);
+      reservationToken = this.dedup.claim(hash, this.effectiveLeaseMinutes());
       if (reservationToken === null) {
-        return { saved: false, reason: 'duplicate' };
+        // Only a committed entry is a final "duplicate"; a pending one belongs to
+        // an interaction that may still fail, so the caller is told it can retry.
+        return this.dedup.status(hash) === 'committed'
+          ? { saved: false, reason: 'duplicate' }
+          : { saved: false, reason: 'duplicate_in_flight', retryable: true };
       }
 
       let analysis: AnalysisResult;
@@ -125,28 +134,39 @@ export class AutoMemoryMiddleware {
       }
 
       const brain = getBrainClient();
-      await brain.save({
-        type: analysis.type,
-        content: analysis.summary,
-        tags: analysis.tags,
-        source: { ...source, tool: source.tool === 'manual' ? 'manual' : 'auto-memory' },
-        metadata: {
-          confidence: analysis.confidence,
-          originalRequest: request.substring(0, 500),
-          context: analysis.context,
-          contentHash: hash,
-        },
-      });
+      keepClaim = true; // from here on the brain may have stored the entry
+      try {
+        await brain.save({
+          type: analysis.type,
+          content: analysis.summary,
+          tags: analysis.tags,
+          source: { ...source, tool: source.tool === 'manual' ? 'manual' : 'auto-memory' },
+          metadata: {
+            confidence: analysis.confidence,
+            originalRequest: request.substring(0, 500),
+            context: analysis.context,
+            contentHash: hash,
+          },
+        });
+      } catch (error) {
+        if (this.isDefiniteSaveFailure(error)) keepClaim = false;
+        throw error;
+      }
 
-      // The brain save is durable at this point. Preserve the active claim and
-      // account for the saved entry even if refreshing the dedup TTL fails.
+      // The brain save is durable at this point: promote the claim to committed
+      // and account for the entry even if the dedup store misbehaves.
       persisted = true;
       const currentCount = this.sessionEntries.get(sessionKey) || 0;
       this.sessionEntries.set(sessionKey, currentCount + 1);
       try {
-        this.dedup.add(hash, this.config.deduplicationWindowMinutes);
-      } catch {
-        // The original claim remains in place until its TTL expires.
+        this.dedup.commit(hash, reservationToken, this.config.deduplicationWindowMinutes);
+      } catch (err) {
+        this.logDedupError('commit', err);
+        try {
+          this.dedup.add(hash, this.config.deduplicationWindowMinutes);
+        } catch (err2) {
+          this.logDedupError('add', err2); // claim then expires with its lease
+        }
       }
       return { saved: true, entry: analysis };
     } finally {
@@ -154,24 +174,56 @@ export class AutoMemoryMiddleware {
       if (currentReserved <= 1) this.sessionReservations.delete(sessionKey);
       else this.sessionReservations.set(sessionKey, currentReserved - 1);
 
-      if (reservationToken !== null && !persisted) {
+      if (reservationToken !== null && !persisted && !keepClaim) {
         try {
           this.dedup.release(hash, reservationToken);
-        } catch {
-          // Preserve the original analysis/save outcome; the reservation expires by TTL.
+        } catch (err) {
+          // Preserve the original analysis/save outcome; the reservation expires with its lease.
+          this.logDedupError('release', err);
         }
       }
     }
   }
 
+  /**
+   * The lease must outlive the worst-case processing time (analysis + brain save);
+   * otherwise a claim could expire mid-flight and let a second interaction duplicate it.
+   */
+  private effectiveLeaseMinutes(): number {
+    const brainTimeoutMs = Number(process.env.BRAIN_TIMEOUT_MS) || 30_000;
+    const floorMs = this.config.analysisTimeoutMs + brainTimeoutMs + 1_000;
+    return Math.max(this.config.claimLeaseMinutes * 60_000, floorMs) / 60_000;
+  }
+
+  /** Only failures where the brain provably did NOT store the entry may release the claim. */
+  private isDefiniteSaveFailure(error: unknown): boolean {
+    if (!(error instanceof AppError)) return false;
+    if (error.code === 'RATE_LIMITED') return true;
+    if (error.code !== 'BRAIN_HTTP_ERROR') return false; // TIMEOUT / BRAIN_UNREACHABLE: outcome unknown
+    const status = Number(error.details?.status);
+    // 4xx (except 408 Request Timeout) and 503 Service Unavailable mean "not processed".
+    // 500 / 502 / 504 may have partially or fully processed the request: keep the claim.
+    return (status >= 400 && status < 500 && status !== 408) || status === 503;
+  }
+
+  private logDedupError(op: string, err: unknown): void {
+    console.error(
+      `[AutoMemory] dedup ${op} failed (non-fatal):`,
+      err instanceof Error ? err.message : err
+    );
+  }
+
   private async analyzeImportance(request: string, response: string): Promise<AnalysisResult> {
     const prompt = `Analysiere diese AI-Interaktion und bestimme ob sie fuer langfristiges Wissen gespeichert werden sollte.\n\nREQUEST:\n${request.substring(0, 2000)}\n\nRESPONSE:\n${response.substring(0, 3000)}\n\nAntworte NUR mit validem JSON in diesem Format:\n{\n  "isImportant": boolean,\n  "type": "decision" | "fix" | "learning" | "pattern" | "preference" | "config" | "error" | "context" | "conversation",\n  "summary": "Kurze Zusammenfassung (max 200 Zeichen)",\n  "tags": ["tag1", "tag2", "tag3"],\n  "confidence": 0.0-1.0,\n  "context": "Optional: Warum ist das wichtig?"\n}\n\nRegeln:\n- isImportant=true NUR wenn: Entscheidung, Bug-Fix, Learning, Pattern, Preference, Config\n- isImportant=false fuer Smalltalk und einfache Fragen\n- confidence: 0.9+ sehr wichtig, 0.7-0.9 wichtig, <0.7 nicht speichern\n- tags: max 5, lowercase`;
 
-    const message = await this.getAnthropic().messages.create({
-      model: this.config.analysisModel,
-      max_tokens: 500,
-      messages: [{ role: 'user', content: prompt }],
-    });
+    const message = await this.getAnthropic().messages.create(
+      {
+        model: this.config.analysisModel,
+        max_tokens: 500,
+        messages: [{ role: 'user', content: prompt }],
+      },
+      { timeout: this.config.analysisTimeoutMs, maxRetries: 0 }
+    );
 
     const block = message.content[0];
     if (!block || block.type !== 'text') {
@@ -239,11 +291,13 @@ export class AutoMemoryMiddleware {
     config: AutoMemoryConfig;
     sessionCounts: Record<string, number>;
     dedupSize: number;
+    dedupBackend: 'sqlite' | 'memory';
   } {
     return {
       config: { ...this.config },
       sessionCounts: Object.fromEntries(this.sessionEntries),
       dedupSize: this.dedup.size(),
+      dedupBackend: this.dedup.backend,
     };
   }
 

@@ -5,37 +5,12 @@ import { _resetBrainClientForTests } from '../src/brain/client.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createDedupStore } from '../src/lib/dedup-store.js';
+import { createDedupStore, createMemoryDedupStore } from '../src/lib/dedup-store.js';
+import { contentHash } from '../src/lib/hash.js';
 
+// Use the production in-memory implementation so these tests exercise the real two-phase semantics.
 function memoryDedup(): DedupStore {
-  const map = new Map<string, number>();
-  return {
-    has: (h) => {
-      const exp = map.get(h);
-      if (exp === undefined) return false;
-      if (Date.now() > exp) {
-        map.delete(h);
-        return false;
-      }
-      return true;
-    },
-    claim: (h, ttl) => {
-      const exp = map.get(h);
-      if (exp !== undefined && Date.now() <= exp) return null;
-      const reservationToken = Date.now() + ttl * 60_000;
-      map.set(h, reservationToken);
-      return reservationToken;
-    },
-    release: (h, reservationToken) => {
-      if (map.get(h) === reservationToken) map.delete(h);
-    },
-    add: (h, ttl) => {
-      map.set(h, Date.now() + ttl * 60_000);
-    },
-    purgeExpired: () => 0,
-    size: () => map.size,
-    close: () => map.clear(),
-  };
+  return createMemoryDedupStore();
 }
 
 describe('AutoMemoryMiddleware', () => {
@@ -138,7 +113,9 @@ describe('AutoMemoryMiddleware concurrent deduplication', () => {
     expect(analyze).toHaveBeenCalledTimes(1);
     expect(global.fetch).toHaveBeenCalledTimes(1);
     expect(results.filter((result) => result.saved)).toHaveLength(1);
-    expect(results.filter((result) => result.reason === 'duplicate')).toHaveLength(1);
+    // The loser raced an in-flight interaction: it is retryable, not a final duplicate.
+    expect(results.filter((result) => result.reason === 'duplicate_in_flight')).toHaveLength(1);
+    expect(results.find((result) => result.reason === 'duplicate_in_flight')?.retryable).toBe(true);
 
     mw.close();
     _resetBrainClientForTests();
@@ -314,11 +291,11 @@ describe('SQLite dedup reservations', () => {
 
     try {
       const firstToken = first.claim(hash, 1);
-      expect(firstToken).toEqual(expect.any(Number));
+      expect(firstToken).toEqual(expect.any(String));
       expect(second.claim(hash, 1)).toBeNull();
       first.release(hash, firstToken!);
       const secondToken = second.claim(hash, 1);
-      expect(secondToken).toEqual(expect.any(Number));
+      expect(secondToken).toEqual(expect.any(String));
       second.release(hash, secondToken!);
     } finally {
       first.close();
@@ -337,11 +314,12 @@ describe('SQLite dedup reservations', () => {
     try {
       now.mockReturnValue(1_700_000_000_000);
       const oldToken = first.claim(hash, 1);
-      expect(oldToken).toBe(1_700_000_060_000);
+      expect(oldToken).toEqual(expect.any(String));
 
       now.mockReturnValue(1_700_000_060_001);
       const newToken = second.claim(hash, 1);
-      expect(newToken).toBe(1_700_000_120_001);
+      expect(newToken).toEqual(expect.any(String));
+      expect(newToken).not.toBe(oldToken);
 
       first.release(hash, oldToken!);
       expect(second.has(hash)).toBe(true);
@@ -425,11 +403,12 @@ describe('AutoMemoryMiddleware concurrent session limits', () => {
 
 
 describe('AutoMemoryMiddleware durable-save recovery', () => {
-  it('keeps the active dedup claim when refreshing its TTL fails after save', async () => {
+  it('still records a committed entry when promoting the claim fails after save', async () => {
     const dedup = memoryDedup();
-    const add = vi.spyOn(dedup, 'add').mockImplementation(() => {
+    const commit = vi.spyOn(dedup, 'commit').mockImplementation(() => {
       throw new Error('temporary dedup store failure');
     });
+    vi.spyOn(console, 'error').mockImplementation(() => {});
     const mw = new AutoMemoryMiddleware(
       { enabled: true, minConfidence: 0.7, maxEntriesPerSession: 2 },
       dedup
@@ -462,7 +441,8 @@ describe('AutoMemoryMiddleware durable-save recovery', () => {
         session_id: 'durable-save-session',
       })).resolves.toMatchObject({ saved: true });
 
-      expect(add).toHaveBeenCalledTimes(1);
+      expect(commit).toHaveBeenCalledTimes(1);
+      expect(dedup.status(contentHash('durable request\n---\ndurable response'))).toBe('committed');
       expect(mw.getStatus().sessionCounts['durable-save-session']).toBe(1);
       await expect(mw.processInteraction('durable request', 'durable response', {
         tool: 'manual',

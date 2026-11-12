@@ -86,8 +86,12 @@ export class BrainClient {
   }
 
   async save(entry: Omit<BrainEntry, 'id' | 'timestamp'>): Promise<BrainEntry> {
+    // Lets an idempotency-aware backend collapse retries of an ambiguous save
+    // (timeout / lost response). Ignored by backends that do not support it.
+    const key = entry.metadata?.contentHash;
     return this.request<BrainEntry>('/api/brain/entries', {
       method: 'POST',
+      headers: typeof key === 'string' ? { 'Idempotency-Key': key } : undefined,
       body: JSON.stringify(entry),
     });
   }
