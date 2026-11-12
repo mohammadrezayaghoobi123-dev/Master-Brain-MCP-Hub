@@ -127,6 +127,11 @@ export function createDedupStore(explicitPath?: string): DedupStore {
   try {
     return new SqliteDedupStore(path);
   } catch (err) {
+    if (process.env.DEDUP_REQUIRE_SQLITE === '1') {
+      throw new Error(
+        `SQLite is required but unavailable; refusing in-memory fallback: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
     console.error(
       '[DedupStore] SQLite unavailable, using in-memory fallback:',
       err instanceof Error ? err.message : err
