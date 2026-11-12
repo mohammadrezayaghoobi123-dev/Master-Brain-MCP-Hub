@@ -34,10 +34,10 @@ jobs:
           npm config get omit
           npm config get optional
           npm config get ignore-scripts
-          npm view better-sqlite3@12.12.0 version engines scripts dependencies --json
+          npm view better-sqlite3@12.11.2 version engines scripts dependencies --json
 
       - name: Upgrade optional SQLite dependency and regenerate lock
-        run: npm install --include=optional --foreground-scripts --verbose --save-optional 'better-sqlite3@^12.12.0' --no-audit --no-fund
+        run: npm install --include=optional --foreground-scripts --verbose --save-optional 'better-sqlite3@^12.11.2' --no-audit --no-fund
 
       - name: Assert resolved SQLite dependency
         run: |
