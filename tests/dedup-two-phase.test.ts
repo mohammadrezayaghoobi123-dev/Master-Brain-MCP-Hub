@@ -117,6 +117,14 @@ describe.each([
     expect(store.status('h')).toBe('committed');
   });
 
+  it('records a stale durable save after lease expiry when no successor owns the key', () => {
+    const stale = store.claim('expired-h', 1)!;
+    advance(MIN + 1);
+    store.purgeExpired();
+    expect(store.commit('expired-h', stale, 30)).toBe(false);
+    expect(store.status('expired-h')).toBe('committed');
+  });
+
   it('release only removes the caller\'s own pending claim', () => {
     const stale = store.claim('h', 1)!;
     advance(MIN + 1);

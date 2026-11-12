@@ -29,8 +29,8 @@ export interface DedupStore {
   claim(hash: string, leaseMinutes: number): string | null;
   /**
    * Promote the caller's pending reservation to committed for `ttlMinutes`.
-   * A committed entry exists afterwards in every case (the save is durable);
-   * returns false when the reservation had been lost in the meantime.
+   * If ownership was lost, record the durable save only when no current row exists;
+   * never overwrite a successor's live reservation. Returns false when ownership was lost.
    */
   commit(hash: string, token: string, ttlMinutes: number): boolean;
   /** Deletes the entry only if it is still the caller's PENDING reservation. */
@@ -203,8 +203,9 @@ class SqliteDedupStore implements DedupStore {
       .run(Date.now() + ttlMinutes * 60_000, hash, token);
     if (result.changes === 1) return true;
 
-    // INSERT OR IGNORE records a durable save only when no live row exists.
-    // In particular, it cannot replace a newer owner's pending reservation.
+    // Remove only expired rows, then record the durable save only if the key is free.
+    // INSERT OR IGNORE cannot replace a newer owner's live pending reservation.
+    this.purgeExpired();
     this.db
       .prepare(
         "INSERT OR IGNORE INTO content_hashes(hash, expires_at, state, owner) VALUES(?, ?, 'committed', NULL)"
