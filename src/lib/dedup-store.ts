@@ -71,6 +71,7 @@ class MemoryDedupStore implements DedupStore {
   }
 
   claim(hash: string, leaseMinutes: number): string | null {
+    assertValidLease(leaseMinutes);
     if (this.live(hash)) return null;
     const owner = randomUUID();
     this.entries.set(hash, { exp: Date.now() + leaseMinutes * 60_000, state: 'pending', owner });
@@ -134,6 +135,19 @@ class SqliteDedupStore implements DedupStore {
 
     mkdirSync(dirname(dbPath), { recursive: true });
     this.db = new Database(dbPath);
+    try {
+      this.init();
+    } catch (err) {
+      try {
+        this.db.close();
+      } catch {
+        /* best effort: never mask the original error */
+      }
+      throw err;
+    }
+  }
+
+  private init(): void {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS content_hashes (
         hash TEXT PRIMARY KEY,
@@ -167,6 +181,7 @@ class SqliteDedupStore implements DedupStore {
   }
 
   claim(hash: string, leaseMinutes: number): string | null {
+    assertValidLease(leaseMinutes);
     this.purgeExpired();
     const owner = randomUUID();
     const result = this.db
@@ -221,6 +236,13 @@ class SqliteDedupStore implements DedupStore {
 
   close(): void {
     this.db.close();
+  }
+}
+
+/** A non-finite lease would be stored as NULL by SQLite and silently turn every claim into a no-op. */
+function assertValidLease(leaseMinutes: number): void {
+  if (!Number.isFinite(leaseMinutes) || leaseMinutes <= 0) {
+    throw new RangeError(`[DedupStore] lease must be a positive finite number of minutes, got ${leaseMinutes}`);
   }
 }
 

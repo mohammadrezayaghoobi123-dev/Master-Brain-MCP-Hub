@@ -398,3 +398,43 @@ describe('SQLite unavailable (controlled)', () => {
     }
   });
 });
+
+describe('robustness (independent-review findings)', () => {
+  it('closes the SQLite handle when initialisation fails after opening', () => {
+    let closed = 0;
+    class FailingDb {
+      exec(): void {
+        throw new Error('disk I/O error');
+      }
+      prepare(): never {
+        throw new Error('unreachable');
+      }
+      close(): void {
+        closed++;
+      }
+    }
+    expect(() =>
+      createDedupStore(join(dir, 'init-fails.sqlite'), { requireSqlite: true, loadDriver: () => FailingDb })
+    ).toThrow('disk I/O error');
+    expect(closed).toBe(1);
+  });
+
+  it.each([
+    ['memory', () => createMemoryDedupStore()],
+    ['sqlite', () => createDedupStore(dbPath)],
+  ])('rejects a non-finite or non-positive lease instead of silently no-oping (%s)', (_name, make) => {
+    const store = make();
+    for (const bad of [Number.NaN, Infinity, 0, -1]) {
+      expect(() => store.claim('bad-lease', bad)).toThrow('lease must be');
+    }
+    expect(store.status('bad-lease')).toBeNull();
+    store.close();
+  });
+
+  it('still saves when lease-related config is NaN (falls back to defaults)', async () => {
+    global.fetch = vi.fn().mockResolvedValue(okResponse()) as unknown as typeof fetch;
+    const mw = makeMw(createMemoryDedupStore(), { analysisTimeoutMs: Number.NaN, claimLeaseMinutes: Number.NaN });
+    await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({ saved: true });
+    mw.close();
+  });
+});
