@@ -1,0 +1,80 @@
+# TEMPORARY probe (throwaway branch only; never merge). Finds a better-sqlite3 version that installs and
+# passes the dedup tests on Node 26, regenerates package.json/package-lock.json with real npm, and pushes
+# them to THIS throwaway branch so a human can review the diff before applying it to the PR branch.
+name: probe-better-sqlite3
+
+on:
+  push:
+    branches:
+      - tmp/lock-probe-better-sqlite3
+
+permissions:
+  contents: write
+
+jobs:
+  resolve:
+    name: resolve-on-node-26
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "26"
+          package-manager-cache: false
+      - name: Registry facts
+        run: |
+          node -v; npm -v
+          npm view better-sqlite3 dist-tags --json
+          npm view better-sqlite3 engines --json || true
+          npm view better-sqlite3 version
+      - name: Try candidates, keep the first that works
+        run: |
+          set -u
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          cp package.json /tmp/pkg.bak; cp package-lock.json /tmp/lock.bak
+          for C in latest 12; do
+            echo "::group::candidate better-sqlite3@$C"
+            cp /tmp/pkg.bak package.json; cp /tmp/lock.bak package-lock.json; rm -rf node_modules
+            if npm install -O "better-sqlite3@$C" --no-audit --no-fund \
+               && node -e "const D=require('better-sqlite3');new D(':memory:').close();console.log('driver ok on',process.version)" \
+               && DEDUP_REQUIRE_SQLITE=1 npm run test:run; then
+              V=$(node -p "require('better-sqlite3/package.json').version")
+              echo "::endgroup::"
+              echo "WORKING VERSION: $V"
+              git add package.json package-lock.json
+              git commit -m "probe: better-sqlite3@$V resolves and passes on Node 26"
+              git push origin HEAD:tmp/lock-probe-better-sqlite3
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "candidate $C FAILED"
+          done
+          echo "NO CANDIDATE WORKED"; exit 1
+
+  verify:
+    name: verify-node-${{ matrix.node-version }}
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [20, 22, 24, 26]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: tmp/lock-probe-better-sqlite3
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ matrix.node-version }}
+          package-manager-cache: false
+      - run: npm ci --no-audit --no-fund
+      - run: npm ls better-sqlite3
+      - run: npm run typecheck
+      - run: npm run test:run
+        env:
+          DEDUP_REQUIRE_SQLITE: "1"
+      - run: npm run build
