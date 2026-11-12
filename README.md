@@ -12,7 +12,7 @@
 - **Explicit Auto-Memory** — `brain_observe` runs Haiku importance analysis and persists high-confidence items
 - **Structured errors** — stable `{ code, message, details? }` on every failure path
 - **Zod validation** at the MCP tool boundary
-- **SHA-256 deduplication** with SQLite-backed (or in-memory fallback) hash store
+- **SHA-256 deduplication** with SQLite-backed persistence (in-memory fallback only where explicitly permitted)
 - **Contracts-first** — `CONTRACTS/api_contract.md` matches `src/brain/client.ts`
 
 ## Architecture
@@ -111,6 +111,14 @@ Typical places: SessionEnd hook, after a verified fix, or when the agent records
 Threshold: `AUTO_MEMORY_MIN_CONFIDENCE` (default `0.7`).  
 Dedup: SHA-256 of normalized request+response, TTL `deduplicationWindowMinutes`.
 
+## Persistence and failure semantics
+
+- SQLite is the durable deduplication backend. Set `DEDUP_DB_PATH` or `DATA_DIR` to a writable persistent location; the default database path is `.data/auto-memory-dedup.sqlite` under the working directory.
+- In `NODE_ENV=production`, SQLite is mandatory. If SQLite cannot be loaded, initialized, migrated, or opened, startup fails rather than silently falling back to process-local memory. `requireSqlite: false` cannot disable this production rule.
+- Outside production, an in-memory fallback may be used when SQLite is unavailable unless `DEDUP_REQUIRE_SQLITE=1` (or `true`) is set. Memory fallback does not survive process restarts and does not coordinate across processes; it is not suitable for production.
+- Deduplication uses a short-lived `pending` claim followed by a `committed` state after the backend save is acknowledged. Once save success is confirmed, that durable fact takes precedence over a successor lease created after expiry; this prevents a later failed successor from erasing evidence of the earlier save. An ambiguous save outcome (timeout, connection loss, unreadable success response, or any HTTP error) keeps the pending claim until its lease expires. This avoids an immediate duplicate retry but may delay a legitimate retry.
+- The backend contract currently does not guarantee server-side idempotency keys or that any HTTP error proves no write occurred. Therefore this client does **not** claim end-to-end exactly-once persistence. A retry after lease expiry can still duplicate a write if the backend committed the first request but its response was lost.
+
 ## Environment
 
 See `.env.example`. Critical variables:
@@ -124,6 +132,7 @@ See `.env.example`. Critical variables:
 | `AUTO_MEMORY_MIN_CONFIDENCE` | `0.0`–`1.0` |
 | `AUTO_MEMORY_MODEL` | Anthropic model id |
 | `DATA_DIR` / `DEDUP_DB_PATH` | Persistent dedup store location |
+| `DEDUP_REQUIRE_SQLITE` | Require SQLite outside production (`1` / `true`) |
 
 ## Development
 
@@ -144,6 +153,7 @@ npm run build
 2. Auto-Memory is **not** ambient; without `brain_observe` (or equivalent) nothing is analysed.
 3. Importance classification quality is model-dependent; no published precision/recall yet — treat thresholds as policy, not science, until evaluated on labeled data.
 4. `auto_memory_config` changes are process-local only.
+5. SQLite deduplication protects this client from many concurrent/retry duplicates, but it cannot guarantee exactly-once persistence without a backend idempotency contract and implementation.
 
 ## License
 
