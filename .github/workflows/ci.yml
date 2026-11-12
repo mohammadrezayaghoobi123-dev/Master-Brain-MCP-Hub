@@ -41,6 +41,8 @@ jobs:
         run: npm run typecheck
 
       - name: Unit tests
+        env:
+          DEDUP_REQUIRE_SQLITE: "1"
         run: npm run test:run
 
       - name: Build
