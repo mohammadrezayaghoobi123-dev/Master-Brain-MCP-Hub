@@ -29,14 +29,15 @@ export interface DedupStore {
   claim(hash: string, leaseMinutes: number): string | null;
   /**
    * Promote the caller's pending reservation to committed for `ttlMinutes`.
-   * A committed entry exists afterwards in every case (the save is durable);
-   * returns false when the reservation had been lost in the meantime.
+   * The caller invokes this only after the Brain confirms a durable save. Persist that
+   * fact even if the original lease expired and a successor claimed the same hash.
+   * Returns false when the caller no longer owned the pending reservation.
    */
   commit(hash: string, token: string, ttlMinutes: number): boolean;
   /** Deletes the entry only if it is still the caller's PENDING reservation. */
   release(hash: string, token: string): void;
-  /** Upserts a committed entry. */
-  add(hash: string, ttlMinutes: number): void;
+  /** Records a committed entry if free; a token marks post-save recovery and makes durable success authoritative. */
+  add(hash: string, ttlMinutes: number, token?: string): void;
   purgeExpired(): number;
   size(): number;
   close(): void;
@@ -71,7 +72,6 @@ class MemoryDedupStore implements DedupStore {
   }
 
   claim(hash: string, leaseMinutes: number): string | null {
-    assertValidLease(leaseMinutes);
     if (this.live(hash)) return null;
     const owner = randomUUID();
     this.entries.set(hash, { exp: Date.now() + leaseMinutes * 60_000, state: 'pending', owner });
@@ -79,10 +79,19 @@ class MemoryDedupStore implements DedupStore {
   }
 
   commit(hash: string, token: string, ttlMinutes: number): boolean {
-    const e = this.entries.get(hash);
-    const owned = e !== undefined && e.state === 'pending' && e.owner === token;
-    this.entries.set(hash, { exp: Date.now() + ttlMinutes * 60_000, state: 'committed', owner: null });
-    return owned;
+    const e = this.live(hash);
+    const owned = e?.state === 'pending' && e.owner === token;
+
+    // This method is called only after the Brain save was acknowledged.
+    // Durable success outranks any still-live pending lease for the same hash:
+    // retaining that lease after a confirmed save could lose the committed marker
+    // if the successor later fails before its own save.
+    this.entries.set(hash, {
+      exp: Date.now() + ttlMinutes * 60_000,
+      state: 'committed',
+      owner: null,
+    });
+    return Boolean(owned);
   }
 
   release(hash: string, token: string): void {
@@ -90,8 +99,16 @@ class MemoryDedupStore implements DedupStore {
     if (e && e.state === 'pending' && e.owner === token) this.entries.delete(hash);
   }
 
-  add(hash: string, ttlMinutes: number): void {
-    this.entries.set(hash, { exp: Date.now() + ttlMinutes * 60_000, state: 'committed', owner: null });
+  add(hash: string, ttlMinutes: number, token?: string): void {
+    const current = this.live(hash);
+    if (current && !token) return;
+
+    // A token is supplied only by the post-save recovery path. The Brain has
+    // already acknowledged persistence, so the committed fact must supersede
+    // a successor lease just as commit() does.
+    if (token || !current) {
+      this.entries.set(hash, { exp: Date.now() + ttlMinutes * 60_000, state: 'committed', owner: null });
+    }
   }
 
   purgeExpired(): number {
@@ -135,19 +152,6 @@ class SqliteDedupStore implements DedupStore {
 
     mkdirSync(dirname(dbPath), { recursive: true });
     this.db = new Database(dbPath);
-    try {
-      this.init();
-    } catch (err) {
-      try {
-        this.db.close();
-      } catch {
-        /* best effort: never mask the original error */
-      }
-      throw err;
-    }
-  }
-
-  private init(): void {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS content_hashes (
         hash TEXT PRIMARY KEY,
@@ -181,7 +185,6 @@ class SqliteDedupStore implements DedupStore {
   }
 
   claim(hash: string, leaseMinutes: number): string | null {
-    assertValidLease(leaseMinutes);
     this.purgeExpired();
     const owner = randomUUID();
     const result = this.db
@@ -194,14 +197,29 @@ class SqliteDedupStore implements DedupStore {
   }
 
   commit(hash: string, token: string, ttlMinutes: number): boolean {
+    const expiresAt = Date.now() + ttlMinutes * 60_000;
     const result = this.db
       .prepare(
         `UPDATE content_hashes SET state = 'committed', owner = NULL, expires_at = ?
          WHERE hash = ? AND state = 'pending' AND owner = ?`
       )
-      .run(Date.now() + ttlMinutes * 60_000, hash, token);
+      .run(expiresAt, hash, token);
     if (result.changes === 1) return true;
-    this.add(hash, ttlMinutes); // lease was lost, but the save is durable: still record it
+
+    // The Brain save was acknowledged. Record that durable fact even if this
+    // lease expired and a successor claimed the hash in the meantime. The
+    // UPSERT is atomic and prevents a later failed successor from erasing
+    // knowledge that the earlier request was already persisted.
+    this.db
+      .prepare(
+        `INSERT INTO content_hashes(hash, expires_at, state, owner)
+         VALUES(?, ?, 'committed', NULL)
+         ON CONFLICT(hash) DO UPDATE SET
+           expires_at = excluded.expires_at,
+           state = 'committed',
+           owner = NULL`
+      )
+      .run(hash, expiresAt);
     return false;
   }
 
@@ -211,13 +229,30 @@ class SqliteDedupStore implements DedupStore {
       .run(hash, token);
   }
 
-  add(hash: string, ttlMinutes: number): void {
+  add(hash: string, ttlMinutes: number, token?: string): void {
+    this.purgeExpired();
+    const expiresAt = Date.now() + ttlMinutes * 60_000;
+    if (!token) {
+      this.db
+        .prepare(
+          "INSERT OR IGNORE INTO content_hashes(hash, expires_at, state, owner) VALUES(?, ?, 'committed', NULL)"
+        )
+        .run(hash, expiresAt);
+      return;
+    }
+
+    // The token is passed only after a confirmed Brain save. Preserve that
+    // durable fact even if another pending lease has since taken ownership.
     this.db
       .prepare(
-        `INSERT INTO content_hashes(hash, expires_at, state, owner) VALUES(?, ?, 'committed', NULL)
-         ON CONFLICT(hash) DO UPDATE SET expires_at = excluded.expires_at, state = 'committed', owner = NULL`
+        `INSERT INTO content_hashes(hash, expires_at, state, owner)
+         VALUES(?, ?, 'committed', NULL)
+         ON CONFLICT(hash) DO UPDATE SET
+           expires_at = excluded.expires_at,
+           state = 'committed',
+           owner = NULL`
       )
-      .run(hash, Date.now() + ttlMinutes * 60_000);
+      .run(hash, expiresAt);
   }
 
   purgeExpired(): number {
@@ -239,13 +274,6 @@ class SqliteDedupStore implements DedupStore {
   }
 }
 
-/** A non-finite lease would be stored as NULL by SQLite and silently turn every claim into a no-op. */
-function assertValidLease(leaseMinutes: number): void {
-  if (!Number.isFinite(leaseMinutes) || leaseMinutes <= 0) {
-    throw new RangeError(`[DedupStore] lease must be a positive finite number of minutes, got ${leaseMinutes}`);
-  }
-}
-
 /** In-process store (tests, or explicit opt-out of persistence). */
 export function createMemoryDedupStore(): DedupStore {
   return new MemoryDedupStore();
@@ -254,8 +282,8 @@ export function createMemoryDedupStore(): DedupStore {
 export interface CreateDedupStoreOptions {
   /**
    * Fail closed: throw instead of falling back to the in-memory store when SQLite is unavailable.
-   * Defaults to env DEDUP_REQUIRE_SQLITE=1|true. The in-memory store gives NO cross-process or
-   * restart-surviving deduplication, so environments that rely on it must opt in to being strict.
+   * Required in NODE_ENV=production, or when DEDUP_REQUIRE_SQLITE=1|true. Production cannot
+   * override this with requireSqlite:false. The in-memory store has no cross-process or restart persistence.
    */
   requireSqlite?: boolean;
   /** Test seam: replaces `require('better-sqlite3')`. */
@@ -264,7 +292,9 @@ export interface CreateDedupStoreOptions {
 
 export function createDedupStore(explicitPath?: string, options: CreateDedupStoreOptions = {}): DedupStore {
   const requireSqlite =
-    options.requireSqlite ?? ['1', 'true'].includes((process.env.DEDUP_REQUIRE_SQLITE ?? '').toLowerCase());
+    process.env.NODE_ENV === 'production' ||
+    options.requireSqlite === true ||
+    ['1', 'true'].includes((process.env.DEDUP_REQUIRE_SQLITE ?? '').toLowerCase());
   const path =
     explicitPath ||
     process.env.DEDUP_DB_PATH ||
@@ -275,7 +305,7 @@ export function createDedupStore(explicitPath?: string, options: CreateDedupStor
   } catch (err) {
     if (requireSqlite) {
       throw new Error(
-        `[DedupStore] SQLite is required (DEDUP_REQUIRE_SQLITE) but unavailable: ${err instanceof Error ? err.message : String(err)}`,
+        `[DedupStore] SQLite is required (production or DEDUP_REQUIRE_SQLITE) but unavailable: ${err instanceof Error ? err.message : String(err)}`,
         { cause: err }
       );
     }
