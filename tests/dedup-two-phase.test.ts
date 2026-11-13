@@ -344,6 +344,22 @@ describe('ambiguous save outcome (response loss)', () => {
     mw.close();
   });
 
+  it('keeps UNKNOWN when a 2xx response body violates the BrainEntry contract', async () => {
+    const store = createMemoryDedupStore();
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 201,
+      json: async () => ({ ok: true }),
+    }) as unknown as typeof fetch;
+    const mw = makeMw(store);
+    await expect(mw.processInteraction('req', 'res', SRC)).rejects.toMatchObject({
+      code: 'BRAIN_HTTP_ERROR',
+    });
+    expect(store.status(HASH)).toBe('unknown');
+    expect(mw.getStatus().unknownClaims.count).toBe(1);
+    mw.close();
+  });
+
   it('treats a 2xx response with an unreadable body as ambiguous, not as a failed save', async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
