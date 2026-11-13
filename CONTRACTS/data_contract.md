@@ -50,12 +50,19 @@ SQLite table `content_hashes` (path: `$DATA_DIR/.data/auto-memory-dedup.sqlite`)
 ```sql
 CREATE TABLE content_hashes (
   hash TEXT PRIMARY KEY,
-  expires_at INTEGER NOT NULL
+  expires_at INTEGER NOT NULL,
+  state TEXT NOT NULL DEFAULT 'committed', -- pending | committed
+  owner TEXT
 );
 CREATE INDEX idx_hashes_expires ON content_hashes(expires_at);
 ```
 
-This store is **not** the Brain database; it only prevents duplicate auto-saves inside the Hub process fleet when a shared DATA_DIR is used.
+- `pending`: a time-bounded reservation owned by one in-flight interaction.
+- `committed`: the Brain save was acknowledged; the longer deduplication TTL applies.
+- A release is conditional on both `state='pending'` and the matching owner token.
+- After a confirmed Brain save, `commit` / owner-aware recovery records `committed` even if the original lease expired and a successor claimed the same hash. This preserves the durable fact if the successor later fails before saving.
+
+This store is **not** the Brain database; it coordinates duplicate auto-saves only among Hub processes that share the same SQLite file.
 
 ---
 

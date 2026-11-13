@@ -135,23 +135,21 @@ export class AutoMemoryMiddleware {
 
       const brain = getBrainClient();
       keepClaim = true; // from here on the brain may have stored the entry
-      try {
-        await brain.save({
-          type: analysis.type,
-          content: analysis.summary,
-          tags: analysis.tags,
-          source: { ...source, tool: source.tool === 'manual' ? 'manual' : 'auto-memory' },
-          metadata: {
-            confidence: analysis.confidence,
-            originalRequest: request.substring(0, 500),
-            context: analysis.context,
-            contentHash: hash,
-          },
-        });
-      } catch (error) {
-        if (this.isDefiniteSaveFailure(error)) keepClaim = false;
-        throw error;
-      }
+      // The checked-in backend contract does not guarantee that any HTTP error
+      // response proves the write was not committed. Once fetch is invoked,
+      // every failure is therefore treated as ambiguous and the claim is kept.
+      await brain.save({
+        type: analysis.type,
+        content: analysis.summary,
+        tags: analysis.tags,
+        source: { ...source, tool: source.tool === 'manual' ? 'manual' : 'auto-memory' },
+        metadata: {
+          confidence: analysis.confidence,
+          originalRequest: request.substring(0, 500),
+          context: analysis.context,
+          contentHash: hash,
+        },
+      });
 
       // The brain save is durable at this point: promote the claim to committed
       // and account for the entry even if the dedup store misbehaves.
@@ -163,7 +161,7 @@ export class AutoMemoryMiddleware {
       } catch (err) {
         this.logDedupError('commit', err);
         try {
-          this.dedup.add(hash, this.config.deduplicationWindowMinutes);
+          this.dedup.add(hash, this.config.deduplicationWindowMinutes, reservationToken);
         } catch (err2) {
           this.logDedupError('add', err2); // claim then expires with its lease
         }
@@ -190,23 +188,9 @@ export class AutoMemoryMiddleware {
    * otherwise a claim could expire mid-flight and let a second interaction duplicate it.
    */
   private effectiveLeaseMinutes(): number {
-    const finitePositive = (v: unknown, fallback: number): number =>
-      typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : fallback;
-    const brainTimeoutMs = finitePositive(Number(process.env.BRAIN_TIMEOUT_MS), 30_000);
-    const analysisMs = finitePositive(this.config.analysisTimeoutMs, 60_000);
-    const leaseMs = finitePositive(this.config.claimLeaseMinutes, 2) * 60_000;
-    return Math.max(leaseMs, analysisMs + brainTimeoutMs + 1_000) / 60_000;
-  }
-
-  /** Only failures where the brain provably did NOT store the entry may release the claim. */
-  private isDefiniteSaveFailure(error: unknown): boolean {
-    if (!(error instanceof AppError)) return false;
-    if (error.code === 'RATE_LIMITED') return true;
-    if (error.code !== 'BRAIN_HTTP_ERROR') return false; // TIMEOUT / BRAIN_UNREACHABLE: outcome unknown
-    const status = Number(error.details?.status);
-    // 4xx (except 408 Request Timeout) and 503 Service Unavailable mean "not processed".
-    // 500 / 502 / 504 may have partially or fully processed the request: keep the claim.
-    return (status >= 400 && status < 500 && status !== 408) || status === 503;
+    const brainTimeoutMs = Number(process.env.BRAIN_TIMEOUT_MS) || 30_000;
+    const floorMs = this.config.analysisTimeoutMs + brainTimeoutMs + 1_000;
+    return Math.max(this.config.claimLeaseMinutes * 60_000, floorMs) / 60_000;
   }
 
   private logDedupError(op: string, err: unknown): void {

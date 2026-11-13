@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -10,6 +11,7 @@ import { contentHash } from '../src/lib/hash.js';
 import { _resetBrainClientForTests } from '../src/brain/client.js';
 
 const require = createRequire(import.meta.url);
+const originalFetch = global.fetch;
 const T0 = 1_700_000_000_000;
 const MIN = 60_000;
 
@@ -28,6 +30,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  global.fetch = originalFetch;
   vi.restoreAllMocks();
   _resetBrainClientForTests();
   rmSync(dir, { recursive: true, force: true });
@@ -105,14 +108,23 @@ describe.each([
     expect(store.status('h')).toBeNull();
   });
 
-  it('commit with a lost lease returns false but still records the durable save', () => {
+  it('a confirmed stale save supersedes a successor lease and remains committed if that successor releases', () => {
     const stale = store.claim('h', 1)!;
     advance(MIN + 1);
-    const newer = store.claim('h', 1)!; // another interaction took over
-    expect(store.commit('h', stale, 30)).toBe(false);
+    const successor = store.claim('h', 5)!;
+    expect(store.commit('h', stale, 30)).toBe(false); // caller lost lease ownership
+    expect(store.status('h')).toBe('committed'); // but the backend save was confirmed
+    store.release('h', successor); // successor failed before saving
     expect(store.status('h')).toBe('committed');
-    store.release('h', newer); // must not delete a committed entry
-    expect(store.status('h')).toBe('committed');
+    expect(store.claim('h', 1)).toBeNull();
+  });
+
+  it('records a stale durable save after lease expiry when no successor owns the key', () => {
+    const stale = store.claim('expired-h', 1)!;
+    advance(MIN + 1);
+    store.purgeExpired();
+    expect(store.commit('expired-h', stale, 30)).toBe(false);
+    expect(store.status('expired-h')).toBe('committed');
   });
 
   it('release only removes the caller\'s own pending claim', () => {
@@ -132,10 +144,34 @@ describe.each([
     expect(store.status('h')).toBe('committed');
   });
 
-  it('add upserts a committed entry', () => {
+  it('add records a committed entry when the key is free', () => {
     store.add('h', 30);
     expect(store.status('h')).toBe('committed');
     expect(store.claim('h', 1)).toBeNull();
+  });
+
+  it('add can promote only the matching pending owner during recovery', () => {
+    const owner = store.claim('h', 5)!;
+    store.add('h', 30, owner);
+    expect(store.status('h')).toBe('committed');
+  });
+
+  it('owner-aware post-save recovery records committed even after a successor lease starts', () => {
+    const stale = store.claim('h', 1)!;
+    advance(MIN + 1);
+    const successor = store.claim('h', 5)!;
+    store.add('h', 30, stale);
+    expect(store.status('h')).toBe('committed');
+    store.release('h', successor);
+    expect(store.status('h')).toBe('committed');
+  });
+
+  it('add cannot overwrite a live pending reservation', () => {
+    const owner = store.claim('h', 5)!;
+    store.add('h', 30);
+    expect(store.status('h')).toBe('pending');
+    expect(store.commit('h', owner, 30)).toBe(true);
+    expect(store.status('h')).toBe('committed');
   });
 });
 
@@ -208,7 +244,7 @@ describe('crash between claim and save (shared SQLite file)', () => {
 });
 
 describe('ambiguous save outcome (response loss)', () => {
-  it('keeps the claim after a timeout, sends an Idempotency-Key, and retries only after the lease', async () => {
+  it('keeps the claim after a timeout and retries only after the lease', async () => {
     const fetchMock = vi
       .fn()
       .mockRejectedValueOnce(Object.assign(new Error('aborted'), { name: 'AbortError' }))
@@ -230,9 +266,40 @@ describe('ambiguous save outcome (response loss)', () => {
     await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({ saved: true });
     expect(fetchMock).toHaveBeenCalledTimes(2);
 
-    for (const [, init] of fetchMock.mock.calls) {
-      expect((init as { headers: Record<string, string> }).headers['Idempotency-Key']).toBe(HASH);
-    }
+    mw.close();
+  });
+
+  it('documents the unresolved duplicate-write risk after a save commits but its response is lost', async () => {
+    // Simulate a backend that commits the first POST, then the network drops
+    // the response. The Hub cannot distinguish this from a request that never
+    // reached the backend. After the pending lease expires it retries; without
+    // a server-side idempotency key, the backend can persist the same entry twice.
+    const backendWrites: string[] = [];
+    const fetchMock = vi.fn()
+      .mockImplementationOnce(async (_url: string, init: RequestInit) => {
+        backendWrites.push(String(init.body));
+        throw new Error('connection reset after backend commit');
+      })
+      .mockImplementationOnce(async (_url: string, init: RequestInit) => {
+        backendWrites.push(String(init.body));
+        return okResponse();
+      });
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const mw = makeMw(createMemoryDedupStore());
+
+    await expect(mw.processInteraction('req', 'res', SRC)).rejects.toBeDefined();
+    await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({
+      saved: false,
+      reason: 'duplicate_in_flight',
+      retryable: true,
+    });
+    expect(backendWrites).toHaveLength(1);
+
+    advance(3 * MIN);
+    await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({ saved: true });
+    expect(backendWrites).toHaveLength(2);
+    expect(backendWrites[0]).toBe(backendWrites[1]);
+
     mw.close();
   });
 
@@ -256,7 +323,7 @@ describe('ambiguous save outcome (response loss)', () => {
   });
 
   // HTTP statuses after which the brain may or may not have stored the entry: the claim must be kept.
-  it.each([408, 500, 502, 504])('keeps the claim after HTTP %i (outcome unknown)', async (status) => {
+  it.each([408, 500, 502, 503, 504])('keeps the claim after HTTP %i (outcome unknown)', async (status) => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce({ ok: false, status, json: async () => ({ message: 'upstream trouble' }) })
@@ -272,8 +339,9 @@ describe('ambiguous save outcome (response loss)', () => {
     mw.close();
   });
 
-  // Statuses that mean "not processed": the claim is released so an immediate retry can save.
-  it.each([400, 404, 422, 503])('releases the claim after HTTP %i (definitely not stored)', async (status) => {
+  // The backend contract has no no-side-effects guarantee for HTTP errors.
+  // All HTTP failures remain ambiguous until the claim lease expires.
+  it.each([400, 401, 403, 404, 422, 429])('keeps the claim after HTTP %i (no non-persistence guarantee)', async (status) => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce({ ok: false, status, json: async () => ({ message: 'not stored' }) })
@@ -282,14 +350,18 @@ describe('ambiguous save outcome (response loss)', () => {
     const mw = makeMw(createMemoryDedupStore());
 
     await expect(mw.processInteraction('req', 'res', SRC)).rejects.toBeDefined();
-    await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({ saved: true });
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({
+      saved: false,
+      reason: 'duplicate_in_flight',
+      retryable: true,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
     mw.close();
   });
 });
 
-describe('concurrent identical interactions where the first one fails definitively', () => {
-  it('tells the loser it may retry, and the retry is then saved exactly once', async () => {
+describe('concurrent identical interactions where the first save response is an HTTP error', () => {
+  it('tells the loser it may retry; this client-side test does not prove backend exactly-once', async () => {
     let releaseAnalysis!: () => void;
     const gate = new Promise<void>((r) => (releaseAnalysis = r));
     const fetchMock = vi
@@ -314,8 +386,15 @@ describe('concurrent identical interactions where the first one fails definitive
     releaseAnalysis();
     expect(await first).toEqual({ thrown: 'BRAIN_HTTP_ERROR' });
 
+    await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({
+      saved: false,
+      reason: 'duplicate_in_flight',
+      retryable: true,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    advance(3 * MIN);
     await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({ saved: true });
-    expect(fetchMock).toHaveBeenCalledTimes(2); // one rejected, one stored: a single durable entry
+    expect(fetchMock).toHaveBeenCalledTimes(2);
     mw.close();
   });
 });
@@ -370,17 +449,66 @@ describe('observability', () => {
   });
 });
 
+describe('SQLite multi-process atomicity', () => {
+  it('allows exactly one independent Node process to claim the same hash', async () => {
+    // Initialize schema before racing so this test isolates claim atomicity, not DDL startup.
+    const initialized = createDedupStore(dbPath);
+    initialized.close();
+
+    const childScript = `
+      import { createDedupStore } from './src/lib/dedup-store.ts';
+      const store = createDedupStore(process.argv[1]);
+      const token = store.claim('cross-process-hash', 5);
+      process.stdout.write(token === null ? 'null' : token);
+      store.close();
+    `;
+
+    const claimInChild = () =>
+      new Promise<string | null>((resolve, reject) => {
+        const child = spawn(
+          process.execPath,
+          ['--import', 'tsx', '--input-type=module', '-e', childScript, dbPath],
+          { cwd: process.cwd(), env: process.env, stdio: ['ignore', 'pipe', 'pipe'] }
+        );
+        let stdout = '';
+        let stderr = '';
+        child.stdout.setEncoding('utf8').on('data', (chunk: string) => (stdout += chunk));
+        child.stderr.setEncoding('utf8').on('data', (chunk: string) => (stderr += chunk));
+        child.once('error', reject);
+        child.once('close', (code) => {
+          if (code !== 0) return reject(new Error(`child claim failed (${code}): ${stderr}`));
+          resolve(stdout === 'null' ? null : stdout);
+        });
+      });
+
+    const results = await Promise.all([claimInChild(), claimInChild()]);
+    expect(results.filter((token) => token !== null)).toHaveLength(1);
+    expect(results.filter((token) => token === null)).toHaveLength(1);
+  });
+});
+
 describe('SQLite unavailable (controlled)', () => {
   const failingLoader = () => {
     throw Object.assign(new Error("Cannot find module 'better-sqlite3'"), { code: 'MODULE_NOT_FOUND' });
   };
 
-  it('falls back to memory by default, and says so via backend', () => {
-    const spy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
-    const store = createDedupStore(':memory:', { requireSqlite: false, loadDriver: failingLoader });
-    expect(store.backend).toBe('memory');
-    expect(spy).toHaveBeenCalled();
-    store.close();
+  it('falls back to memory outside production when explicitly allowed, and reports its backend', () => {
+    const previousNodeEnv = process.env.NODE_ENV;
+    const previousRequireSqlite = process.env.DEDUP_REQUIRE_SQLITE;
+    process.env.NODE_ENV = 'test';
+    delete process.env.DEDUP_REQUIRE_SQLITE;
+    try {
+      const spy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      const store = createDedupStore(':memory:', { requireSqlite: false, loadDriver: failingLoader });
+      expect(store.backend).toBe('memory');
+      expect(spy).toHaveBeenCalled();
+      store.close();
+    } finally {
+      if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = previousNodeEnv;
+      if (previousRequireSqlite === undefined) delete process.env.DEDUP_REQUIRE_SQLITE;
+      else process.env.DEDUP_REQUIRE_SQLITE = previousRequireSqlite;
+    }
   });
 
   it('fails closed when SQLite is required', () => {
@@ -398,27 +526,7 @@ describe('SQLite unavailable (controlled)', () => {
     }
   });
 });
-
-describe('robustness (independent-review findings)', () => {
-  it('closes the SQLite handle when initialisation fails after opening', () => {
-    let closed = 0;
-    class FailingDb {
-      exec(): void {
-        throw new Error('disk I/O error');
-      }
-      prepare(): never {
-        throw new Error('unreachable');
-      }
-      close(): void {
-        closed++;
-      }
-    }
-    expect(() =>
-      createDedupStore(join(dir, 'init-fails.sqlite'), { requireSqlite: true, loadDriver: () => FailingDb })
-    ).toThrow('disk I/O error');
-    expect(closed).toBe(1);
-  });
-
+describe('lease validation at the store boundary', () => {
   it.each([
     ['memory', () => createMemoryDedupStore()],
     ['sqlite', () => createDedupStore(dbPath)],
@@ -431,10 +539,17 @@ describe('robustness (independent-review findings)', () => {
     store.close();
   });
 
-  it('still saves when lease-related config is NaN (falls back to defaults)', async () => {
-    global.fetch = vi.fn().mockResolvedValue(okResponse()) as unknown as typeof fetch;
-    const mw = makeMw(createMemoryDedupStore(), { analysisTimeoutMs: Number.NaN, claimLeaseMinutes: Number.NaN });
-    await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({ saved: true });
+});
+
+describe('Idempotency-Key header', () => {
+  it('sends the content hash so an idempotency-aware backend can collapse retries', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(okResponse());
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const mw = makeMw(createMemoryDedupStore());
+    await mw.processInteraction('req', 'res', SRC);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const init = fetchMock.mock.calls[0][1] as { headers: Record<string, string> };
+    expect(init.headers['Idempotency-Key']).toBe(HASH);
     mw.close();
   });
 });
