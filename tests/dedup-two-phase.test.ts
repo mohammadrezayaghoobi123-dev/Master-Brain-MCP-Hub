@@ -650,3 +650,27 @@ describe('deduplication window validation (review finding P5-1)', () => {
     store.close();
   });
 });
+
+describe('claim lease bounds (review findings P8-1, P5-2)', () => {
+  const lease = (cfg: Record<string, unknown>) =>
+    (makeMw(createMemoryDedupStore(), cfg) as unknown as { effectiveLeaseMinutes(): number }).effectiveLeaseMinutes();
+
+  it('clamps an absurdly long configured lease to 24 hours instead of blocking a crashed claim for years', () => {
+    expect(lease({ claimLeaseMinutes: 3_000_000_000 })).toBe(1440);
+    expect(lease({ claimLeaseMinutes: Number.MAX_VALUE })).toBe(1440);
+  });
+
+  it('keeps a sane configured lease and falls back to the default for invalid values', () => {
+    expect(lease({ claimLeaseMinutes: 5 })).toBe(5);
+    expect(lease({ claimLeaseMinutes: Number.NaN })).toBe(2);
+    expect(lease({ claimLeaseMinutes: -3 })).toBe(2);
+  });
+
+  it('stores a normalised lease in the config (constructor and updateConfig)', () => {
+    const mw = makeMw(createMemoryDedupStore(), { claimLeaseMinutes: Number.NaN });
+    expect(mw.getStatus().config.claimLeaseMinutes).toBe(2);
+    mw.updateConfig({ claimLeaseMinutes: 3_000_000_000 });
+    expect(mw.getStatus().config.claimLeaseMinutes).toBe(1440);
+    mw.close();
+  });
+});

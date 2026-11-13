@@ -36,11 +36,13 @@ function finitePositiveTimeout(value: unknown, fallback: number): number {
     : fallback;
 }
 
-function finitePositiveLeaseMinutes(value: unknown, fallback: number): number {
-  const maxMinutes = (Number.MAX_SAFE_INTEGER - Date.now()) / 60_000;
-  return typeof value === 'number' && Number.isFinite(value) && value > 0 && value <= maxMinutes
-    ? value
-    : fallback;
+/** Longest configurable claim lease: a crash after claim blocks that content for at most this long. */
+const MAX_CONFIGURED_LEASE_MINUTES = 24 * 60;
+
+/** Invalid (NaN, <= 0, non-number) -> fallback; absurdly long -> clamped to MAX_CONFIGURED_LEASE_MINUTES. */
+function boundedLeaseMinutes(value: unknown, fallback: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return fallback;
+  return Math.min(value, MAX_CONFIGURED_LEASE_MINUTES);
 }
 
 /** A non-finite or non-positive number of minutes would make the dedup store reject or never expire entries. */
@@ -78,6 +80,10 @@ export class AutoMemoryMiddleware {
     this.config.deduplicationWindowMinutes = finitePositiveMinutes(
       this.config.deduplicationWindowMinutes,
       DEFAULT_CONFIG.deduplicationWindowMinutes
+    );
+    this.config.claimLeaseMinutes = boundedLeaseMinutes(
+      this.config.claimLeaseMinutes,
+      DEFAULT_CONFIG.claimLeaseMinutes
     );
     this.dedup = dedup ?? createDedupStore();
 
@@ -218,7 +224,7 @@ export class AutoMemoryMiddleware {
   private effectiveLeaseMinutes(): number {
     const brainTimeoutMs = finitePositiveTimeout(Number(process.env.BRAIN_TIMEOUT_MS), 30_000);
     const analysisMs = finitePositiveTimeout(this.config.analysisTimeoutMs, DEFAULT_CONFIG.analysisTimeoutMs);
-    const configuredLeaseMs = finitePositiveLeaseMinutes(this.config.claimLeaseMinutes, 2) * 60_000;
+    const configuredLeaseMs = boundedLeaseMinutes(this.config.claimLeaseMinutes, DEFAULT_CONFIG.claimLeaseMinutes) * 60_000;
     return Math.max(configuredLeaseMs, analysisMs + brainTimeoutMs + 1_000) / 60_000;
   }
 
@@ -311,6 +317,12 @@ export class AutoMemoryMiddleware {
       normalized.deduplicationWindowMinutes = finitePositiveMinutes(
         normalized.deduplicationWindowMinutes,
         DEFAULT_CONFIG.deduplicationWindowMinutes
+      );
+    }
+    if (normalized.claimLeaseMinutes !== undefined) {
+      normalized.claimLeaseMinutes = boundedLeaseMinutes(
+        normalized.claimLeaseMinutes,
+        DEFAULT_CONFIG.claimLeaseMinutes
       );
     }
     this.config = { ...this.config, ...normalized };
