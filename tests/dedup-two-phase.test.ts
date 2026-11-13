@@ -206,6 +206,7 @@ describe.each([
 
   it('a committed entry cannot be released', () => {
     const token = store.claim('h', 1)!;
+    store.markUnknown('h', token);
     store.commit('h', token, 30);
     store.release('h', token);
     expect(store.status('h')).toBe('committed');
