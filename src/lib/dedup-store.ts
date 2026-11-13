@@ -34,8 +34,8 @@ export interface DedupStore {
   commit(hash: string, token: string, ttlMinutes: number): boolean;
   /** Deletes the entry only if it is still the caller's PENDING reservation. UNKNOWN is never released. */
   release(hash: string, token: string): void;
-  /** Record a committed entry only if free (no token) or still owned by the supplied token. */
-  add(hash: string, ttlMinutes: number, token?: string): void;
+  /** Record a committed entry only when no reservation or quarantine currently exists. */
+  add(hash: string, ttlMinutes: number): void;
   /** Safe operational summary of quarantined UNKNOWN rows; never exposes hashes or owner tokens. */
   unknownStats(): { count: number; oldestAt: number | null };
   purgeExpired(): number;
@@ -92,7 +92,7 @@ class MemoryDedupStore implements DedupStore {
   commit(hash: string, token: string, ttlMinutes: number): boolean {
     const expiresAt = expiresAtForTtl(ttlMinutes);
     const e = this.live(hash);
-    if (!e || (e.state !== 'pending' && e.state !== 'unknown') || e.owner !== token) {
+    if (!e || e.state !== 'unknown' || e.owner !== token) {
       return false;
     }
     this.entries.set(hash, {
@@ -109,16 +109,9 @@ class MemoryDedupStore implements DedupStore {
     if (e && e.state === 'pending' && e.owner === token) this.entries.delete(hash);
   }
 
-  add(hash: string, ttlMinutes: number, token?: string): void {
+  add(hash: string, ttlMinutes: number): void {
     const expiresAt = expiresAtForTtl(ttlMinutes);
-    const current = this.live(hash);
-    if (token) {
-      if (!current || current.owner !== token || current.state !== 'pending') {
-        return;
-      }
-    } else if (current) {
-      return;
-    }
+    if (this.live(hash)) return;
     this.entries.set(hash, {
       exp: expiresAt,
       state: 'committed',
@@ -258,9 +251,9 @@ class SqliteDedupStore implements DedupStore {
       .prepare(
         `UPDATE content_hashes SET state = 'committed', owner = NULL, expires_at = ?, unknown_since = NULL
          WHERE hash = ? AND owner = ?
-           AND (state = 'unknown' OR (state = 'pending' AND expires_at >= ?))`
+           AND state = 'unknown'`
       )
-      .run(expiresAt, hash, token, now);
+      .run(expiresAt, hash, token);
     return result.changes === 1;
   }
 
@@ -270,25 +263,15 @@ class SqliteDedupStore implements DedupStore {
       .run(hash, token);
   }
 
-  add(hash: string, ttlMinutes: number, token?: string): void {
+  add(hash: string, ttlMinutes: number): void {
     const now = Date.now();
     const expiresAt = expiresAtForTtl(ttlMinutes, now);
     this.purgeExpired();
-    if (!token) {
-      this.db
-        .prepare(
-          "INSERT OR IGNORE INTO content_hashes(hash, expires_at, state, owner) VALUES(?, ?, 'committed', NULL)"
-        )
-        .run(hash, expiresAt);
-      return;
-    }
-
     this.db
       .prepare(
-        `UPDATE content_hashes SET state = 'committed', owner = NULL, expires_at = ?, unknown_since = NULL
-         WHERE hash = ? AND owner = ? AND state = 'pending'`
+        "INSERT OR IGNORE INTO content_hashes(hash, expires_at, state, owner) VALUES(?, ?, 'committed', NULL)"
       )
-      .run(expiresAt, hash, token);
+      .run(hash, expiresAt);
   }
 
   unknownStats(): { count: number; oldestAt: number | null } {
