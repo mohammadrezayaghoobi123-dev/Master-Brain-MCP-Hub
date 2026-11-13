@@ -423,9 +423,10 @@ Implemented on `fix/unknown-state-hard-lease-2026-11-13`:
 
 ### 17.2 Verification
 
-The exact implementation SHA `1060033216cdafb1dc49057974f9a5c01146a0f6` passed CI run `43468704750`:
-- Node 22, 24, and 26: typecheck, 169 unit tests, and build passed.
+The exact implementation/test SHA `263538e37a7f10d672c0eaba806f72899cdb136d` passed CI run `43469564256`:
+- Node 22, 24, and 26: typecheck, 173 unit tests, and build passed.
 - Dependency audit gate passed.
+- The final state-machine cycle verifies that only `unknown -> committed` is permitted; `commit(pending)` fails, and `add` has no owner-token overload.
 - TDD red/green cycles were recorded in `docs/reviews/2026-11-13-claim-timeout-idempotency-verification.md`.
 
 The deterministic PR #5 two-child-process SQLite barrier test section was compared byte-for-byte and remains unchanged. PR #5 and PR #8 heads remain unchanged.
