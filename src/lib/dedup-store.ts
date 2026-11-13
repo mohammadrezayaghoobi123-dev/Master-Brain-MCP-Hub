@@ -1,12 +1,12 @@
 // Persistent content-hash store for auto-memory deduplication (two-phase).
 //
-//   pending   = reservation held by ONE in-flight interaction; short lease.
-//   committed = the save is durable; retained for the dedup window.
+//   pending   = pre-dispatch reservation; expires after its lease.
+//   unknown   = a write may have been dispatched; durable quarantine, no expiry.
+//   committed = the save is confirmed; retained for the dedup window.
 //
-// Why two phases: a single long-TTL claim turns a crash between claim and save
-// into silent data loss (the interaction is rejected as "duplicate" although
-// nothing was stored). A pending claim expires after its lease, a committed
-// entry only exists after the brain acknowledged the save.
+// A possibly dispatched write must never become claimable merely because its
+// lease elapsed. UNKNOWN is intentionally non-expiring until authoritative
+// reconciliation is available. This favors duplicate-write safety over liveness.
 //
 // Uses better-sqlite3 when available; falls back to in-process Map.
 import { createRequire } from 'node:module';
@@ -16,27 +16,24 @@ import { dirname, join } from 'node:path';
 
 const require = createRequire(import.meta.url);
 
-export type DedupState = 'pending' | 'committed';
+export type DedupState = 'pending' | 'unknown' | 'committed';
 
 export interface DedupStore {
   /** Which backend is actually in use (observability: memory means no cross-process dedup). */
   readonly backend: 'sqlite' | 'memory';
-  /** True when a committed entry or a live pending reservation exists. */
+  /** True when a committed, pending, or quarantined unknown entry exists. */
   has(hash: string): boolean;
   /** State of the live entry for `hash`, or null. */
   status(hash: string): DedupState | null;
-  /** Atomically reserve `hash` for `leaseMinutes`. Returns an owner token, or null when a live entry exists. */
+  /** Atomically reserve `hash` for `leaseMinutes`. Returns an owner token, or null when blocked. */
   claim(hash: string, leaseMinutes: number): string | null;
-  /**
-   * Promote the caller's pending reservation to committed for `ttlMinutes`.
-   * The caller invokes this only after the Brain confirms a durable save. Persist that
-   * fact even if the original lease expired and a successor claimed the same hash.
-   * Returns false when the caller no longer owned the pending reservation.
-   */
+  /** Atomically quarantine the current owner's pending claim before external write dispatch. */
+  markUnknown(hash: string, token: string): boolean;
+  /** Commit only the matching current owner; stale owners must never overwrite another claim. */
   commit(hash: string, token: string, ttlMinutes: number): boolean;
-  /** Deletes the entry only if it is still the caller's PENDING reservation. */
+  /** Deletes the entry only if it is still the caller's PENDING reservation. UNKNOWN is never released. */
   release(hash: string, token: string): void;
-  /** Records a committed entry if free; a token marks post-save recovery and makes durable success authoritative. */
+  /** Record a committed entry only if free (no token) or still owned by the supplied token. */
   add(hash: string, ttlMinutes: number, token?: string): void;
   purgeExpired(): number;
   size(): number;
@@ -56,7 +53,7 @@ class MemoryDedupStore implements DedupStore {
   private live(hash: string): MemoryEntry | undefined {
     const e = this.entries.get(hash);
     if (!e) return undefined;
-    if (Date.now() > e.exp) {
+    if (e.state !== 'unknown' && Date.now() > e.exp) {
       this.entries.delete(hash);
       return undefined;
     }
@@ -79,20 +76,26 @@ class MemoryDedupStore implements DedupStore {
     return owner;
   }
 
-  commit(hash: string, token: string, ttlMinutes: number): boolean {
+  markUnknown(hash: string, token: string): boolean {
     const e = this.live(hash);
-    const owned = e?.state === 'pending' && e.owner === token;
+    if (!e || e.state !== 'pending' || e.owner !== token) return false;
+    e.state = 'unknown';
+    e.exp = Number.POSITIVE_INFINITY;
+    return true;
+  }
 
-    // This method is called only after the Brain save was acknowledged.
-    // Durable success outranks any still-live pending lease for the same hash:
-    // retaining that lease after a confirmed save could lose the committed marker
-    // if the successor later fails before its own save.
+  commit(hash: string, token: string, ttlMinutes: number): boolean {
+    assertValidLease(ttlMinutes);
+    const e = this.live(hash);
+    if (!e || (e.state !== 'pending' && e.state !== 'unknown') || e.owner !== token) {
+      return false;
+    }
     this.entries.set(hash, {
       exp: Date.now() + ttlMinutes * 60_000,
       state: 'committed',
       owner: null,
     });
-    return Boolean(owned);
+    return true;
   }
 
   release(hash: string, token: string): void {
@@ -101,22 +104,23 @@ class MemoryDedupStore implements DedupStore {
   }
 
   add(hash: string, ttlMinutes: number, token?: string): void {
+    assertValidLease(ttlMinutes);
     const current = this.live(hash);
-    if (current && !token) return;
-
-    // A token is supplied only by the post-save recovery path. The Brain has
-    // already acknowledged persistence, so the committed fact must supersede
-    // a successor lease just as commit() does.
-    if (token || !current) {
-      this.entries.set(hash, { exp: Date.now() + ttlMinutes * 60_000, state: 'committed', owner: null });
+    if (token) {
+      if (!current || current.owner !== token || (current.state !== 'pending' && current.state !== 'unknown')) {
+        return;
+      }
+    } else if (current) {
+      return;
     }
+    this.entries.set(hash, { exp: Date.now() + ttlMinutes * 60_000, state: 'committed', owner: null });
   }
 
   purgeExpired(): number {
     const now = Date.now();
     let n = 0;
     for (const [h, e] of this.entries) {
-      if (now > e.exp) {
+      if (e.state !== 'unknown' && now > e.exp) {
         this.entries.delete(h);
         n++;
       }
@@ -208,31 +212,28 @@ class SqliteDedupStore implements DedupStore {
     return result.changes === 1 ? owner : null;
   }
 
+  markUnknown(hash: string, token: string): boolean {
+    const result = this.db
+      .prepare(
+        `UPDATE content_hashes SET state = 'unknown', expires_at = ?
+         WHERE hash = ? AND state = 'pending' AND owner = ? AND expires_at >= ?`
+      )
+      .run(Number.MAX_SAFE_INTEGER, hash, token, Date.now());
+    return result.changes === 1;
+  }
+
   commit(hash: string, token: string, ttlMinutes: number): boolean {
-    const expiresAt = Date.now() + ttlMinutes * 60_000;
+    assertValidLease(ttlMinutes);
+    const now = Date.now();
+    const expiresAt = now + ttlMinutes * 60_000;
     const result = this.db
       .prepare(
         `UPDATE content_hashes SET state = 'committed', owner = NULL, expires_at = ?
-         WHERE hash = ? AND state = 'pending' AND owner = ?`
+         WHERE hash = ? AND owner = ?
+           AND (state = 'unknown' OR (state = 'pending' AND expires_at >= ?))`
       )
-      .run(expiresAt, hash, token);
-    if (result.changes === 1) return true;
-
-    // The Brain save was acknowledged. Record that durable fact even if this
-    // lease expired and a successor claimed the hash in the meantime. The
-    // UPSERT is atomic and prevents a later failed successor from erasing
-    // knowledge that the earlier request was already persisted.
-    this.db
-      .prepare(
-        `INSERT INTO content_hashes(hash, expires_at, state, owner)
-         VALUES(?, ?, 'committed', NULL)
-         ON CONFLICT(hash) DO UPDATE SET
-           expires_at = excluded.expires_at,
-           state = 'committed',
-           owner = NULL`
-      )
-      .run(hash, expiresAt);
-    return false;
+      .run(expiresAt, hash, token, now);
+    return result.changes === 1;
   }
 
   release(hash: string, token: string): void {
@@ -242,6 +243,7 @@ class SqliteDedupStore implements DedupStore {
   }
 
   add(hash: string, ttlMinutes: number, token?: string): void {
+    assertValidLease(ttlMinutes);
     this.purgeExpired();
     const expiresAt = Date.now() + ttlMinutes * 60_000;
     if (!token) {
@@ -253,23 +255,17 @@ class SqliteDedupStore implements DedupStore {
       return;
     }
 
-    // The token is passed only after a confirmed Brain save. Preserve that
-    // durable fact even if another pending lease has since taken ownership.
     this.db
       .prepare(
-        `INSERT INTO content_hashes(hash, expires_at, state, owner)
-         VALUES(?, ?, 'committed', NULL)
-         ON CONFLICT(hash) DO UPDATE SET
-           expires_at = excluded.expires_at,
-           state = 'committed',
-           owner = NULL`
+        `UPDATE content_hashes SET state = 'committed', owner = NULL, expires_at = ?
+         WHERE hash = ? AND owner = ? AND state IN ('pending', 'unknown')`
       )
-      .run(hash, expiresAt);
+      .run(expiresAt, hash, token);
   }
 
   purgeExpired(): number {
     const result = this.db
-      .prepare('DELETE FROM content_hashes WHERE expires_at < ?')
+      .prepare("DELETE FROM content_hashes WHERE state != 'unknown' AND expires_at < ?")
       .run(Date.now());
     return result.changes as number;
   }
