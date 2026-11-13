@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { BrainClient } from '../src/brain/client.js';
+import { BrainClient, _resetBrainClientForTests, getBrainClient } from '../src/brain/client.js';
 import { AppError } from '../src/lib/errors.js';
 
 describe('BrainClient', () => {
@@ -118,6 +118,24 @@ describe('BrainClient timeout validation', () => {
     'rejects invalid supplied timeout %s instead of silently normalizing it',
     (timeoutMs) => {
       expect(() => new BrainClient({ baseUrl: 'http://localhost:3001', timeoutMs })).toThrow(RangeError);
+    }
+  );
+});
+
+describe('BRAIN_TIMEOUT_MS environment validation', () => {
+  it.each(['', 'abc', '0', '-1', '1.5', '2147483648', '9007199254740992'])(
+    'fails closed for supplied invalid BRAIN_TIMEOUT_MS=%j',
+    (raw) => {
+      const previous = process.env.BRAIN_TIMEOUT_MS;
+      try {
+        process.env.BRAIN_TIMEOUT_MS = raw;
+        _resetBrainClientForTests();
+        expect(() => getBrainClient()).toThrow(RangeError);
+      } finally {
+        _resetBrainClientForTests();
+        if (previous === undefined) delete process.env.BRAIN_TIMEOUT_MS;
+        else process.env.BRAIN_TIMEOUT_MS = previous;
+      }
     }
   );
 });
