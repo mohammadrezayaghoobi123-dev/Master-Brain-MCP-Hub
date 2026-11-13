@@ -237,12 +237,13 @@ class SqliteDedupStore implements DedupStore {
   }
 
   markUnknown(hash: string, token: string): boolean {
+    const now = Date.now();
     const result = this.db
       .prepare(
         `UPDATE content_hashes SET state = 'unknown', expires_at = ?, unknown_since = ?
          WHERE hash = ? AND state = 'pending' AND owner = ? AND expires_at >= ?`
       )
-      .run(Number.MAX_SAFE_INTEGER, Date.now(), hash, token, Date.now());
+      .run(Number.MAX_SAFE_INTEGER, now, hash, token, now);
     return result.changes === 1;
   }
 
