@@ -200,6 +200,9 @@ class SqliteDedupStore implements DedupStore {
           if (!/duplicate column/i.test(err instanceof Error ? err.message : String(err))) throw err;
         }
       }
+      this.db.exec(
+        'CREATE INDEX IF NOT EXISTS idx_hashes_state_unknown_since ON content_hashes(state, unknown_since)'
+      );
     } catch (error) {
       // A partially initialized native SQLite handle must never leak on schema/migration failure.
       try {
