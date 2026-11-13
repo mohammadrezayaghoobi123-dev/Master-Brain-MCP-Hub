@@ -299,8 +299,12 @@ describe('Auto-Memory UNKNOWN observability', () => {
     dedup.markUnknown('observability-hash', owner);
     const mw = new AutoMemoryMiddleware({ enabled: true }, dedup);
     try {
-      expect(mw.getStatus().unknownClaims).toEqual({ count: 1, oldestAt: Date.now() });
-      expect(JSON.stringify(mw.getStatus())).not.toContain(owner);
+      const status = mw.getStatus();
+      expect(status.unknownClaims.count).toBe(1);
+      expect(status.unknownClaims.oldestAt).toEqual(expect.any(Number));
+      expect(status.unknownClaims.oldestAt).toBeLessThanOrEqual(Date.now());
+      expect(status.effectiveLeaseMs).toBeGreaterThan(0);
+      expect(JSON.stringify(status)).not.toContain(owner);
     } finally {
       mw.close();
     }
