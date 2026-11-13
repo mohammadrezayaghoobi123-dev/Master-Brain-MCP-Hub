@@ -118,6 +118,12 @@ describe.each([
     expect(store.status('h')).toBe('committed');
   });
 
+  it('cannot skip the pending-to-unknown transition when committing', () => {
+    const owner = store.claim('pending-commit', 5)!;
+    expect(store.commit('pending-commit', owner, 30)).toBe(false);
+    expect(store.status('pending-commit')).toBe('pending');
+  });
+
   it('reports unknown quarantine count and oldest timestamp', () => {
     const first = store.claim('unknown-1', 5)!;
     expect(store.markUnknown('unknown-1', first)).toBe(true);
@@ -138,11 +144,18 @@ describe.each([
     expect(store.status('ttl')).toBe('pending');
   });
 
-  it('cannot use add() to resolve an UNKNOWN quarantine, even with its owner token', () => {
+  it('cannot use add() to resolve an UNKNOWN quarantine', () => {
     const owner = store.claim('unknown-add', 5)!;
     expect(store.markUnknown('unknown-add', owner)).toBe(true);
-    store.add('unknown-add', 30, owner);
+    store.add('unknown-add', 30);
     expect(store.status('unknown-add')).toBe('unknown');
+  });
+
+  it('does not expose an owner-token overload that bypasses UNKNOWN transitions', () => {
+    const owner = store.claim('no-add-owner', 5)!;
+    // @ts-expect-error add() is intentionally ownerless; commit() is the only owner-bound finalizer.
+    store.add('no-add-owner', 30, owner);
+    expect(store.status('no-add-owner')).toBe('pending');
   });
 
   it('a pending claim expires with its lease (crash before dispatch) and can be re-claimed', () => {
@@ -152,8 +165,9 @@ describe.each([
     expect(store.claim('h', 1)).toEqual(expect.any(String));
   });
 
-  it('commit promotes pending to committed with the long TTL', () => {
+  it('commit promotes unknown to committed with the long TTL', () => {
     const token = store.claim('h', 1)!;
+    expect(store.markUnknown('h', token)).toBe(true);
     expect(store.commit('h', token, 30)).toBe(true);
     expect(store.status('h')).toBe('committed');
     advance(10 * MIN); // far beyond the original lease
@@ -203,17 +217,19 @@ describe.each([
     expect(store.claim('h', 1)).toBeNull();
   });
 
-  it('add can promote only the matching pending owner during recovery', () => {
+  it('add cannot overwrite a live pending reservation', () => {
     const owner = store.claim('h', 5)!;
-    store.add('h', 30, owner);
-    expect(store.status('h')).toBe('committed');
+    store.add('h', 30);
+    expect(store.status('h')).toBe('pending');
+    expect(store.markUnknown('h', owner)).toBe(true);
+    expect(store.status('h')).toBe('unknown');
   });
 
-  it('owner-aware recovery cannot overwrite a successor lease', () => {
-    const stale = store.claim('h', 1)!;
+  it('ownerless add cannot overwrite a successor lease', () => {
+    store.claim('h', 1);
     advance(MIN + 1);
     const successor = store.claim('h', 5)!;
-    store.add('h', 30, stale);
+    store.add('h', 30);
     expect(store.status('h')).toBe('pending');
     store.release('h', successor);
     expect(store.status('h')).toBeNull();
@@ -223,6 +239,7 @@ describe.each([
     const owner = store.claim('h', 5)!;
     store.add('h', 30);
     expect(store.status('h')).toBe('pending');
+    expect(store.markUnknown('h', owner)).toBe(true);
     expect(store.commit('h', owner, 30)).toBe(true);
     expect(store.status('h')).toBe('committed');
   });
@@ -234,7 +251,9 @@ describe('SQLite two-phase persistence', () => {
     a.claim('pending-hash', 5);
     const unknownOwner = a.claim('unknown-hash', 5)!;
     expect(a.markUnknown('unknown-hash', unknownOwner)).toBe(true);
-    a.commit('committed-hash', a.claim('committed-hash', 5)!, 30);
+    const committedOwner = a.claim('committed-hash', 5)!;
+    a.markUnknown('committed-hash', committedOwner);
+    a.commit('committed-hash', committedOwner, 30);
     a.close();
 
     const b = createDedupStore(dbPath);
