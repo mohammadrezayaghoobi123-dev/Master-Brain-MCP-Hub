@@ -65,11 +65,11 @@ export interface AutoMemoryConfig {
   minConfidence: number;
   excludeTypes: MemoryType[];
   maxEntriesPerSession: number;
-  /** Minutes retained for content-hash deduplication (persistent store). */
+  /** Minutes retained for confirmed content-hash deduplication (persistent store). */
   deduplicationWindowMinutes: number;
-  /** Minutes a pending dedup claim is held before it expires (raised to cover analysis + save time). */
+  /** Configured pre-dispatch claim lease; effective lease is derived and capped at 24 hours. */
   claimLeaseMinutes: number;
-  /** Hard limit for one importance-analysis call. */
+  /** Positive safe-integer millisecond budget for one importance-analysis call. */
   analysisTimeoutMs: number;
   /** Anthropic model id used for importance analysis. */
   analysisModel: string;
