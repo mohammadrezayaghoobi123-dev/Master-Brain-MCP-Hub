@@ -293,6 +293,41 @@ describe('crash between claim and save (shared SQLite file)', () => {
 });
 
 describe('ambiguous save outcome (response loss)', () => {
+  it('does not dispatch when the pending claim expires before UNKNOWN transition', async () => {
+    const store = createMemoryDedupStore();
+    const markUnknown = store.markUnknown.bind(store);
+    vi.spyOn(store, 'markUnknown').mockImplementation((hash, token) => {
+      advance(3 * MIN);
+      return markUnknown(hash, token);
+    });
+    const fetchMock = vi.fn().mockResolvedValue(okResponse());
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const mw = makeMw(store);
+
+    await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({
+      saved: false,
+      reason: 'claim_lost',
+      retryable: false,
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(store.status(HASH)).toBeNull();
+    mw.close();
+  });
+
+  it('does not dispatch when durable UNKNOWN transition throws', async () => {
+    const store = createMemoryDedupStore();
+    vi.spyOn(store, 'markUnknown').mockImplementation(() => {
+      throw new Error('sqlite write failure');
+    });
+    const fetchMock = vi.fn().mockResolvedValue(okResponse());
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const mw = makeMw(store);
+
+    await expect(mw.processInteraction('req', 'res', SRC)).rejects.toThrow('sqlite write failure');
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(store.status(HASH)).toBeNull();
+    mw.close();
+  });
   it('keeps an ambiguous timeout quarantined beyond the original lease', async () => {
     const fetchMock = vi
       .fn()
