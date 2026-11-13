@@ -72,6 +72,7 @@ class MemoryDedupStore implements DedupStore {
   }
 
   claim(hash: string, leaseMinutes: number): string | null {
+    assertValidMinutes('lease', leaseMinutes);
     if (this.live(hash)) return null;
     const owner = randomUUID();
     this.entries.set(hash, { exp: Date.now() + leaseMinutes * 60_000, state: 'pending', owner });
@@ -197,6 +198,7 @@ class SqliteDedupStore implements DedupStore {
   }
 
   claim(hash: string, leaseMinutes: number): string | null {
+    assertValidMinutes('lease', leaseMinutes);
     this.purgeExpired();
     const owner = randomUUID();
     const result = this.db
@@ -288,7 +290,7 @@ class SqliteDedupStore implements DedupStore {
   }
 }
 
-/** A non-finite or non-positive TTL is bound as NULL by SQLite (NOT NULL violation) or never expires. */
+/** A non-finite or non-positive number of minutes is bound as NULL by SQLite (NOT NULL violation) or never expires. */
 function assertValidMinutes(name: string, minutes: number): void {
   if (!Number.isFinite(minutes) || minutes <= 0) {
     throw new RangeError(`[DedupStore] ${name} must be a positive finite number of minutes, got ${minutes}`);

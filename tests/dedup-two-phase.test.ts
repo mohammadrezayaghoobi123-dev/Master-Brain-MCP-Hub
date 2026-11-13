@@ -615,6 +615,34 @@ describe('Auto-Memory analysis timeout validation', () => {
   });
 });
 
+describe('lease validation at the store boundary', () => {
+  it.each([
+    ['memory', () => createMemoryDedupStore()],
+    ['sqlite', () => createDedupStore(dbPath)],
+  ])('rejects a non-finite or non-positive lease instead of silently no-oping (%s)', (_name, make) => {
+    const store = make();
+    for (const bad of [Number.NaN, Infinity, 0, -1]) {
+      expect(() => store.claim('bad-lease', bad)).toThrow('lease must be');
+    }
+    expect(store.status('bad-lease')).toBeNull();
+    store.close();
+  });
+
+});
+
+describe('Idempotency-Key header', () => {
+  it('sends the content hash so an idempotency-aware backend can collapse retries', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(okResponse());
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const mw = makeMw(createMemoryDedupStore());
+    await mw.processInteraction('req', 'res', SRC);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const init = fetchMock.mock.calls[0][1] as { headers: Record<string, string> };
+    expect(init.headers['Idempotency-Key']).toBe(HASH);
+    mw.close();
+  });
+});
+
 describe('deduplication window validation (review finding P5-1)', () => {
   it.each([Number.NaN, Infinity, 0, -1])(
     'commits after a successful save even when deduplicationWindowMinutes is %s (constructor)',
@@ -674,3 +702,4 @@ describe('claim lease bounds (review findings P8-1, P5-2)', () => {
     mw.close();
   });
 });
+
