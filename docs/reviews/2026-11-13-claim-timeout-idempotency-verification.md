@@ -9,7 +9,7 @@
 
 ## 1. Verification result
 
-<badge>HUB BRANCH: CI PASS</badge>
+**HUB BRANCH: CI PASS**
 
 The exact verified head was tested by GitHub Actions run [#102 / 43468704750](https://github.com/mohammadrezayaghoobi123-dev/Master-Brain-MCP-Hub/actions/runs/43468704750).
 
