@@ -474,14 +474,12 @@ describe('SQLite multi-process atomicity', () => {
       }
     `;
 
-    const children: ReturnType<typeof spawn>[] = [];
-    const startChild = () => {
+        const startChild = () => {
       const child = spawn(
         process.execPath,
         ['--import', 'tsx', '--input-type=module', '-e', childScript, dbPath],
         { cwd: process.cwd(), env: process.env, stdio: ['pipe', 'pipe', 'pipe'] }
       );
-      children.push(child);
       let stdout = '';
       let stderr = '';
       let ready = false;
@@ -500,7 +498,7 @@ describe('SQLite multi-process atomicity', () => {
 
       child.stdout.setEncoding('utf8').on('data', (chunk: string) => {
         stdout += chunk;
-        const lines = stdout.split('\\n');
+        const lines = stdout.split('\n');
         if (!ready && lines.includes('READY')) {
           ready = true;
           resolveReady();
@@ -518,7 +516,7 @@ describe('SQLite multi-process atomicity', () => {
           const error = new Error(`child claim failed (${code}): ${stderr}`);
           rejectReady(error);
           rejectResult(error);
-        } else if (!stdout.split('\\n').some((line) => line.startsWith('RESULT:'))) {
+        } else if (!stdout.split('\n').some((line) => line.startsWith('RESULT:'))) {
           rejectResult(new Error(`child exited without a claim result: ${stdout}`));
         }
       });
@@ -533,7 +531,7 @@ describe('SQLite multi-process atomicity', () => {
     try {
       // Do not release either process until both independent SQLite clients are ready.
       await Promise.all(workers.map((worker) => worker.readyPromise));
-      for (const worker of workers) worker.child.stdin.write('GO\\n');
+      for (const worker of workers) worker.child.stdin.write('GO\n');
 
       const results = await Promise.all(workers.map((worker) => worker.resultPromise));
       expect(results.filter((token) => token !== null)).toHaveLength(1);
