@@ -82,7 +82,7 @@ Required invariants:
 6. A stale worker cannot overwrite a newer generation.
 7. Purge/expiry cannot erase evidence needed to reconcile an ambiguous write prematurely.
 
-A monotonically increasing fencing generation SHOULD be persisted per logical key. A random owner token remains useful as an unguessable capability but is not, by itself, an ordered fencing token.
+A monotonically increasing fencing generation MUST be persisted per logical key whenever the generation is used to fence work across process or service boundaries. The generation MUST NOT reset while an older worker or delayed request could still exist; purging a claim row MUST NOT silently reset its generation. A random owner token MUST also be used as an unguessable capability and compared on every state transition. If the implementation cannot guarantee a durable monotonic generation, it MUST use a non-reusable claim identity for Hub-local compare-and-swap and MUST NOT claim downstream fencing.
 
 Important boundary: Hub-side fencing protects Hub state transitions. It cannot revoke a request already accepted by an external Runtime. To fence external side effects, Runtime must validate an idempotency identity or fencing generation inside its own transaction. Until that exists, external exactly-once behavior is UNVERIFIED.
 
@@ -99,12 +99,12 @@ Required logical states:
 Permitted transitions MUST be explicit and tested:
 
 - `AVAILABLE -> PENDING`: atomic claim acquisition.
-- `PENDING -> AVAILABLE`: safe release before any write could have been dispatched.
+- `PENDING -> AVAILABLE`: safe release only when the implementation can prove that no write was dispatched and no side effect can still be in flight.
 - `PENDING -> UNKNOWN`: timeout, connection loss, process interruption, or other ambiguous outcome after dispatch may have begun.
-- `PENDING -> COMMITTED`: Runtime success is confirmed and local commit succeeds.
+- `PENDING -> COMMITTED`: Runtime success is confirmed and local commit succeeds under current owner/generation.
 - `UNKNOWN -> COMMITTED`: reconciliation confirms the original write.
-- `UNKNOWN -> PENDING`: retry is permitted only when the same stable idempotency identity is reused and Runtime guarantees deduplication.
-- `EXPIRED -> AVAILABLE`: only after the recovery policy has considered any associated UNKNOWN outcome; expiry is not proof of non-persistence.
+- `UNKNOWN -> PENDING`: retry is permitted only with the same stable idempotency identity and only after Runtime's atomic deduplication contract is verified.
+- Expired `PENDING` with no possible dispatch MAY return to `AVAILABLE`; expired `PENDING` after possible dispatch MUST enter or remain `UNKNOWN` until reconciliation. `EXPIRED` is an expiry condition, not evidence of non-persistence.
 
 An HTTP error status MUST NOT be assumed to mean no write occurred unless the Runtime contract explicitly guarantees that property for that response and the guarantee is tested.
 
@@ -236,3 +236,131 @@ Until Gate B and Gate C pass, exactly-once persistence and end-to-end exactly-on
 9. Stop before merge/deploy. Those actions require separate explicit authorization.
 
 No implementation, Runtime mutation, merge, deployment, or deletion is authorized by this design document.
+
+
+## 15. Precision amendments: assumptions, time semantics, and concurrency proof
+
+This section resolves implementation-critical ambiguities in the preceding requirements. If any earlier wording conflicts with this section, this section governs.
+
+### 15.1 The 24-hour guarantee and clock trust model
+
+A strict elapsed-real-time upper bound cannot be proven from a wall clock that may move backward, nor can a process-local monotonic clock survive a process restart as a durable timestamp. Therefore the 24-hour rule is defined as a hard protocol bound under an explicit trusted-time assumption:
+
+- During one process lifetime, deadline arithmetic MUST use a monotonic clock.
+- Durable acquisition and expiry instants MUST be stored in UTC using one authoritative clock source.
+- For a single-host SQLite deployment, the host clock is the authority. A detected backward clock jump or implausible clock discontinuity MUST fail closed: no new claim takeover or retry that could create a duplicate write is allowed until time consistency is re-established.
+- For a multi-host deployment, the shared database/server clock MUST be authoritative for durable lease decisions; application-host clocks MUST NOT independently decide ownership.
+- The implementation MUST record acquisition time, expiry time, and the time-source identity/version needed for diagnosis.
+- Recovery after restart MUST conservatively treat an uncertain time interval as unresolved; it MUST NOT shorten an UNKNOWN recovery obligation merely because the local clock changed.
+- The system MUST state this assumption in operational documentation. It MUST NOT claim a mathematically unconditional real-world 24-hour bound in an environment with an untrusted or discontinuous clock.
+
+### 15.2 Correct budget arithmetic for sequential and parallel stages
+
+The aggregate budget MUST be computed from the actual execution dependency graph, not by blindly summing all configured timeouts or taking their maximum.
+
+For sequential stages, the critical-path budget is their sum. For genuinely parallel stages, the relevant duration is the longest bounded path through the execution graph, including synchronization and finalization. Retries MUST be included in the total operation budget; unbounded retry loops are prohibited.
+
+Define:
+
+- `T_critical_path`: maximum bounded duration of the operation's dependency graph, including all allowed retries and waits.
+- `T_finalize`: maximum durable local state-transition duration not already included in the critical path.
+- `T_margin`: explicit bounded safety allowance.
+
+The validated execution floor is:
+
+`T_execution_floor = T_critical_path + T_finalize + T_margin`.
+
+The effective lease is:
+
+`effectiveLease = max(configuredLease, T_execution_floor)`.
+
+Configuration MUST be rejected if any stage/retry is unbounded, if arithmetic overflows a safe integer, or if `T_execution_floor > 86_400_000 ms`. No retry may reset the original operation deadline or extend the original claim's 24-hour maximum.
+
+### 15.3 Ownership linearization points
+
+The implementation MUST document the linearization point for each operation:
+
+- Claim acquisition: the successful atomic insert/conditional update protected by the unique key constraint.
+- Commit: the transaction that verifies current owner token, generation, unexpired lease, and expected state, then writes COMMITTED.
+- Release: the transaction that verifies current owner token, generation, and releasable state, then releases the claim.
+- Expiry takeover: the transaction that verifies expiry using the authoritative time source and checks the prior operation's dispatch/reconciliation state before assigning a new owner.
+
+Each operation MUST be a compare-and-swap against expected prior state. A read followed by an unguarded write is not sufficient. Tests MUST exercise the competing interleavings around these linearization points.
+
+### 15.4 Claim identity, generation retention, and ABA prevention
+
+A claim MUST have a unique owner identity. Where monotonic fencing is required, its generation MUST be strictly increasing for the lifetime of the logical deduplication key. Deleting an expired row and recreating it with generation 1 can create an ABA-style ownership ambiguity and is prohibited if stale work may remain.
+
+Generation retention MUST therefore be handled by one of:
+
+1. a durable per-key generation/tombstone record retained beyond the maximum stale-worker and delayed-request horizon; or
+2. a globally monotonic generation allocator whose uniqueness and durability are enforced transactionally.
+
+The chosen approach MUST be justified against the actual database and deployment topology. A random UUID can prevent accidental identity reuse but does not provide ordered fencing to an external service.
+
+### 15.5 Expiry, UNKNOWN, and safe takeover
+
+Lease expiry only says the lease deadline has elapsed according to the authoritative clock. It does not prove that the worker stopped or that a dispatched write failed.
+
+A new owner MUST NOT take over an expired claim associated with a possibly dispatched write unless one of the following is true:
+
+- Runtime reconciliation confirms that the prior write did not commit and cannot later commit; or
+- Runtime idempotency guarantees that the retry uses the same stable key and cannot create a second logical write.
+
+If neither condition is established, the key remains blocked in UNKNOWN/reconciliation state. This is a deliberate availability trade-off in favor of duplicate-write safety. The implementation MUST expose this blocked state and its age through safe operational telemetry.
+
+### 15.6 Idempotency identity and canonical request fingerprint
+
+The Runtime contract MUST define canonicalization precisely. The fingerprint MUST cover every field that changes the logical side effect, including operation type, tenant/owner scope, target resource, and normalized payload. It MUST exclude transport-only fields that do not change the operation semantics.
+
+Canonicalization MUST be versioned. A key reused with a different canonicalization version or a different fingerprint MUST produce a deterministic conflict or an explicitly specified migration behavior; it MUST NOT silently map to an unrelated prior result.
+
+The Runtime database MUST enforce uniqueness on the scoped idempotency identity. The idempotency record and business write MUST commit or roll back in the same transaction. A transactionally stored result/status MUST be sufficient to answer replay after process restart.
+
+Key retention MUST cover the maximum period during which any client, queue, operator, backup replay, or recovery process could resend the logical operation. If that horizon is unbounded, the system MUST retain a compact tombstone or equivalent deduplication identity indefinitely; deleting the only deduplication evidence is prohibited.
+
+### 15.7 Fault-injection and model-based verification
+
+Beyond ordinary unit tests, the implementation SHOULD include deterministic fault-injection tests at each boundary:
+
+- before dispatch;
+- after dispatch but before Runtime commit;
+- after Runtime commit but before response;
+- after response but before Hub commit;
+- during Hub commit;
+- during process termination/restart;
+- during expiry takeover and concurrent retry.
+
+For each injected fault, assert the invariant: no stale owner can mutate current Hub state, and no ambiguous retry can create a second logical Runtime write.
+
+A small state-transition/property-based test SHOULD generate legal and adversarial interleavings for claim, commit, release, expiry, restart, and retry. The test oracle MUST assert invariants, not merely expected example outputs. Seeds and failing traces MUST be retained for reproducibility.
+
+### 15.8 Observability and operational controls
+
+Structured telemetry MUST include operation correlation ID, hashed/scoped deduplication identity, owner generation, state transition, deadline/expiry, time-source identity, retry count, and outcome classification. It MUST NOT include raw idempotency keys, owner capabilities, credentials, or sensitive payloads.
+
+At minimum, operators MUST be able to detect:
+
+- UNKNOWN claims and their age;
+- claims nearing expiry;
+- stale-owner commit/release attempts;
+- clock discontinuity/fail-closed events;
+- idempotency conflicts;
+- reconciliation failures and backlog;
+- repeated retry exhaustion.
+
+Alerts and runbooks MUST define safe operator actions. Manual deletion of UNKNOWN claims MUST NOT be the default recovery procedure.
+
+### 15.9 Required design assumptions to verify before implementation
+
+The implementation-planning phase MUST verify, rather than assume:
+
+- whether the current SQLite library and transaction usage support the required atomic compare-and-swap semantics;
+- whether the current schema can preserve generation/tombstone state safely;
+- whether the Hub has a real cancellation path through every network/client layer;
+- whether Runtime writes are transactional and which database uniqueness constraints exist;
+- whether Runtime can expose a reconciliation/read-by-idempotency operation;
+- whether the deployment is single-host or multi-host and what clock is authoritative;
+- whether current callers depend on silent timeout/TTL normalization.
+
+Any unanswered item MUST remain an explicit implementation blocker or UNVERIFIED dependency, not be filled by assumption.
