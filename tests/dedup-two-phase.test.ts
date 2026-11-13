@@ -111,6 +111,13 @@ describe.each([
     expect(store.status('h')).toBe('unknown');
   });
 
+  it('the matching owner can commit an unknown outcome after confirmed persistence', () => {
+    const owner = store.claim('h', 1)!;
+    expect(store.markUnknown('h', owner)).toBe(true);
+    expect(store.commit('h', owner, 30)).toBe(true);
+    expect(store.status('h')).toBe('committed');
+  });
+
   it('a pending claim expires with its lease (crash before dispatch) and can be re-claimed', () => {
     store.claim('h', 1);
     advance(MIN + 1);
