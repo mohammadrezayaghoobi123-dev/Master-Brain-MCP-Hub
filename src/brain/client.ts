@@ -7,12 +7,11 @@ import type {
   SearchResult,
 } from '../types/index.js';
 import { AppError } from '../lib/errors.js';
-
-const DEFAULT_BRAIN_TIMEOUT_MS = 30_000;
-
-function finitePositiveTimeout(value: unknown, fallback: number): number {
-  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback;
-}
+import {
+  assertPositiveSafeIntegerMs,
+  DEFAULT_BRAIN_TIMEOUT_MS,
+  parsePositiveSafeIntegerEnv,
+} from '../lib/time-budget.js';
 
 export interface BrainClientConfig {
   baseUrl: string;
@@ -28,7 +27,10 @@ export class BrainClient {
   constructor(config: BrainClientConfig) {
     this.baseUrl = config.baseUrl.replace(/\/$/, '');
     this.apiKey = config.apiKey;
-    this.timeoutMs = finitePositiveTimeout(config.timeoutMs, DEFAULT_BRAIN_TIMEOUT_MS);
+    this.timeoutMs =
+      config.timeoutMs === undefined
+        ? DEFAULT_BRAIN_TIMEOUT_MS
+        : assertPositiveSafeIntegerMs(config.timeoutMs, 'BrainClient timeoutMs');
   }
 
   private async request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
@@ -156,7 +158,7 @@ export function getBrainClient(): BrainClient {
   if (!brainClient) {
     const baseUrl = process.env.BRAIN_API_URL || 'http://localhost:3001';
     const apiKey = process.env.BRAIN_API_KEY || undefined;
-    const timeoutMs = Number(process.env.BRAIN_TIMEOUT_MS) || 30_000;
+    const timeoutMs = parsePositiveSafeIntegerEnv('BRAIN_TIMEOUT_MS', DEFAULT_BRAIN_TIMEOUT_MS);
     brainClient = new BrainClient({ baseUrl, apiKey, timeoutMs });
   }
   return brainClient;
