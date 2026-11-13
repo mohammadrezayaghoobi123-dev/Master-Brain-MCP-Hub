@@ -361,13 +361,15 @@ Any unanswered item MUST remain an explicit implementation blocker or UNVERIFIED
 
 The following facts were verified against repository source, not inferred from the design:
 
-### 16.1 Hub evidence
+### 16.1 Hub baseline evidence (PR #5 head, before this corrective branch)
 
-- The current Hub branch uses `DedupState = 'pending' | 'committed'`; it has no durable `unknown` state.
-- `processInteraction` sets `keepClaim = true` before invoking `brain.save`, but the retained row remains `pending` and is removed by ordinary expiry/purge.
-- The current ambiguous-outcome test explicitly demonstrates that a simulated backend write followed by a lost response is retried after lease expiry, producing two backend write attempts. It documents the duplicate-write risk rather than preventing it.
-- The current `commit` path can UPSERT a confirmed stale save over a successor's pending row. That behavior preserves a confirmed write fact but conflates the durable outcome with current claim ownership.
-- `effectiveLeaseMinutes` has no 24-hour effective cap. Timeout normalization currently substitutes defaults for invalid values in selected paths.
+- The PR #5 baseline used `DedupState = 'pending' | 'committed'` and had no durable `unknown` state.
+- `processInteraction` retained an ambiguous reservation as `pending`; ordinary expiry/purge could remove it.
+- The baseline ambiguous-outcome test explicitly demonstrated that a simulated backend write followed by a lost response was retried after lease expiry, producing two backend write attempts.
+- The baseline `commit` path could UPSERT a confirmed stale save over a successor's pending row, conflating durable outcome with current claim ownership.
+- The baseline `effectiveLeaseMinutes` had no 24-hour effective cap, and selected timeout paths silently substituted defaults for invalid values.
+
+These are baseline facts. The corrective branch implementation is recorded in Section 17 and the verification report.
 
 ### 16.2 Runtime repository evidence and unresolved deployment identity
 
@@ -381,21 +383,59 @@ The Hub client currently targets `/api/brain/entries`. The available evidence do
 
 The connected GitHub identity has read access but no push permission to `Activi-AI/The-Brain`; no Runtime code has been modified.
 
-### 16.3 Hub safety behavior pending Runtime capability
+### 16.3 Hub safety behavior implemented on the corrective branch
 
-Until a transactional Runtime idempotency contract and reconciliation path are available, the Hub must prefer safety over automatic retry after a possibly dispatched write:
-- Before dispatch, the owner transitions its durable row from `pending` to `unknown` in a compare-and-set operation.
-- If the transition cannot be durably confirmed, the Hub must not dispatch the write.
+The isolated Hub branch implements the fail-closed containment behavior:
+- Before dispatch, the owner transitions its durable row from `pending` to `unknown` using an owner-checked compare-and-set.
+- If that transition cannot be durably confirmed, the Hub does not dispatch the write.
 - `unknown` is not expired or purged automatically and blocks a new attempt for the same logical key.
-- A confirmed Runtime success may transition only the same owner-bound `unknown` row to `committed`.
+- Only the same owner may commit the `unknown` row after a contract-valid BrainEntry response.
 - A timeout, transport failure, malformed success response, process restart, or ambiguous HTTP error leaves the row `unknown`.
-- An `unknown` row may be resolved only by an explicit reconciliation procedure supported by authoritative Runtime evidence. No automatic clearing or new-key retry is permitted.
-- This fail-closed behavior can reduce availability and may require operator reconciliation. That is an explicit safety trade-off, not an exactly-once guarantee.
+- Store `add` and `release` cannot resolve or remove `unknown`; a stale owner cannot overwrite a successor.
+- SQLite persists `unknown_since`; safe diagnostics expose only UNKNOWN count and oldest timestamp.
+- Time configuration and store-level durations are validated strictly; effective claim lease is capped at 86,400,000 ms.
 
-This Hub-only containment does not eliminate the need for Runtime idempotency. It prevents the Hub from knowingly reopening the duplicate-write window through lease expiry.
+An `unknown` row still requires an explicit reconciliation procedure backed by authoritative Runtime evidence. No automatic clearing or new-key retry is permitted. The current Runtime has no verified reconciliation API, so unknown rows can remain quarantined indefinitely.
+
+This Hub-only containment does not eliminate the need for Runtime idempotency and is not an exactly-once guarantee.
 
 ### 16.4 Corrections to the review record
 
-- The existing owner token is a random UUID. The defect is not absence of an owner identifier; it is absence of a durable monotonic fencing generation and the ability of a stale confirmed commit path to overwrite a newer claim.
+- The existing owner token is a random UUID. It is sufficient as a Hub-local compare-and-set capability when every mutation checks the current owner. The baseline defect was the unconditional stale-owner UPSERT.
+- No downstream fencing guarantee is claimed. A monotonic generation is required only if a downstream service is to reject stale owners across that service boundary.
 - A durable `unknown` state prevents automatic lease-based takeover, but cannot by itself determine whether a write happened. It is a quarantine/reconciliation state, not proof of persistence.
-- A 24-hour maximum lease bounds ownership duration only. It must never be used as an automatic expiry rule for `unknown` outcomes.
+- A 24-hour maximum lease bounds only the pending claim lifetime. It must never be used as an automatic expiry rule for `unknown` outcomes.
+
+
+## 17. Implementation and verification status (2026-11-13)
+
+### 17.1 Hub implementation
+
+Implemented on `fix/unknown-state-hard-lease-2026-11-13`:
+
+- `DedupStore`: `pending | unknown | committed`, owner-bound `markUnknown`, owner-bound commit, non-expiring UNKNOWN quarantine, no release/purge/add resolution of UNKNOWN, strict lease/TTL conversion, and safe absolute expiry.
+- SQLite: additive `unknown_since` migration, durable quarantine across restart, index for UNKNOWN telemetry, and constructor cleanup retained.
+- Auto-Memory: UNKNOWN transition before network dispatch, fail-closed behavior if transition fails, no automatic retry after ambiguous outcome, and no owner-blind UPSERT fallback.
+- Diagnostics: UNKNOWN count, oldest UNKNOWN timestamp, and derived effective lease milliseconds; no hashes or owner capabilities exposed.
+- Time budget: strict environment parsing, positive safe integer millisecond validation, exact minute conversion, 1,000 ms reserve, and a hard 86,400,000 ms effective lease cap.
+- Brain client: validates the complete documented `BrainEntry` response before considering a 2xx save confirmed. Malformed 2xx responses remain ambiguous.
+- Tests: deterministic expiry, restart, stale owner, lost response, pre-dispatch failure, response validation, strict configuration, lease boundary, and TTL cases.
+
+### 17.2 Verification
+
+The exact implementation SHA `1060033216cdafb1dc49057974f9a5c01146a0f6` passed CI run `43468704750`:
+- Node 22, 24, and 26: typecheck, 169 unit tests, and build passed.
+- Dependency audit gate passed.
+- TDD red/green cycles were recorded in `docs/reviews/2026-11-13-claim-timeout-idempotency-verification.md`.
+
+The deterministic PR #5 two-child-process SQLite barrier test section was compared byte-for-byte and remains unchanged. PR #5 and PR #8 heads remain unchanged.
+
+### 17.3 Remaining blockers
+
+- Deployed Runtime identity and endpoint compatibility remain `UNVERIFIED`.
+- The inspected `Activi-AI/The-Brain` source has no transactional idempotency implementation and its API route differs from the Hub contract.
+- The connected GitHub identity has read-only access to that Runtime repository.
+- No authoritative Runtime idempotency lookup or reconciliation API is available in the inspected source.
+- End-to-end exactly-once persistence remains `UNVERIFIED`.
+- Claude independent review was unavailable; this work has internal adversarial review and CI evidence, not third-party approval.
+- No merge or deployment was performed.
