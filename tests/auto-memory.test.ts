@@ -278,8 +278,8 @@ describe('AutoMemoryMiddleware reservation recovery', () => {
         session_id: 'save-recovery-session',
       })).resolves.toMatchObject({
         saved: false,
-        reason: 'duplicate_in_flight',
-        retryable: true,
+        reason: 'outcome_unknown',
+        retryable: false,
       });
 
       expect(analyze).toHaveBeenCalledTimes(1);
