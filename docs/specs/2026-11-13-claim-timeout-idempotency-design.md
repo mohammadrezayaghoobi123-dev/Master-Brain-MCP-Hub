@@ -34,22 +34,13 @@ The maximum effective claim lifetime is exactly:
 
 The configured claim lease MUST be finite, positive, and no greater than this maximum. Supplied invalid values (including NaN, positive/negative Infinity, zero, negative values, malformed numeric environment values, and values beyond the documented bound) MUST be rejected with `RangeError`; invalid input MUST NOT silently fall back or be silently clamped. An omitted setting MAY use a documented default.
 
-Define explicit, non-overlapping budgets:
-
-- `T_analysis`: maximum analysis duration.
-- `T_backend`: maximum Runtime request duration.
-- `T_finalize`: maximum local durable finalization duration.
-- `T_margin`: explicit safety margin for scheduling/clock/cleanup uncertainty.
-
-The protocol MUST validate:
-
-`T_analysis + T_backend + T_finalize + T_margin <= MAX_EFFECTIVE_LEASE_MS`.
-
-All values MUST be finite positive integers in milliseconds, except a margin may be zero only if the implementation provides a documented reason and tests. Unit conversion MUST be checked for overflow and precision loss.
+Define explicit bounded budgets for every execution stage, retry, wait, and durable finalization step. Stage budgets MUST be finite positive safe integers in milliseconds; a zero safety margin requires a documented justification and dedicated tests. The operation budget MUST be derived from the actual dependency graph's critical path as specified in Section 15.2, not from an assumed serial or parallel relationship. Unit conversion MUST be checked for overflow and precision loss.
 
 The effective lease is derived deterministically as:
 
-`effectiveLease = max(configuredLease, T_analysis + T_backend + T_finalize + T_margin)`.
+`effectiveLease = max(configuredLease, T_execution_floor)`,
+
+where `T_execution_floor` is defined in Section 15.2.
 
 The derived value MUST be <= 24 hours. If the aggregate execution budget exceeds 24 hours, reject configuration with `RangeError`. A configured lease shorter than the validated execution floor is not silently accepted as the actual lease: the effective lease is explicitly derived upward to that floor and the derived value is exposed in safe diagnostics. A configured lease greater than 24 hours is rejected.
 
