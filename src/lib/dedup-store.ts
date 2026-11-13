@@ -13,6 +13,7 @@ import { createRequire } from 'node:module';
 import { randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { leaseMinutesToMs, MAX_EFFECTIVE_LEASE_MS } from './time-budget.js';
 
 const require = createRequire(import.meta.url);
 
@@ -89,7 +90,7 @@ class MemoryDedupStore implements DedupStore {
   }
 
   commit(hash: string, token: string, ttlMinutes: number): boolean {
-    assertValidLease(ttlMinutes);
+    assertValidTtl(ttlMinutes);
     const e = this.live(hash);
     if (!e || (e.state !== 'pending' && e.state !== 'unknown') || e.owner !== token) {
       return false;
@@ -109,10 +110,10 @@ class MemoryDedupStore implements DedupStore {
   }
 
   add(hash: string, ttlMinutes: number, token?: string): void {
-    assertValidLease(ttlMinutes);
+    assertValidTtl(ttlMinutes);
     const current = this.live(hash);
     if (token) {
-      if (!current || current.owner !== token || (current.state !== 'pending' && current.state !== 'unknown')) {
+      if (!current || current.owner !== token || current.state !== 'pending') {
         return;
       }
     } else if (current) {
@@ -251,7 +252,7 @@ class SqliteDedupStore implements DedupStore {
   }
 
   commit(hash: string, token: string, ttlMinutes: number): boolean {
-    assertValidLease(ttlMinutes);
+    assertValidTtl(ttlMinutes);
     const now = Date.now();
     const expiresAt = now + ttlMinutes * 60_000;
     const result = this.db
@@ -271,7 +272,7 @@ class SqliteDedupStore implements DedupStore {
   }
 
   add(hash: string, ttlMinutes: number, token?: string): void {
-    assertValidLease(ttlMinutes);
+    assertValidTtl(ttlMinutes);
     this.purgeExpired();
     const expiresAt = Date.now() + ttlMinutes * 60_000;
     if (!token) {
@@ -286,7 +287,7 @@ class SqliteDedupStore implements DedupStore {
     this.db
       .prepare(
         `UPDATE content_hashes SET state = 'committed', owner = NULL, expires_at = ?, unknown_since = NULL
-         WHERE hash = ? AND owner = ? AND state IN ('pending', 'unknown')`
+         WHERE hash = ? AND owner = ? AND state = 'pending'`
       )
       .run(expiresAt, hash, token);
   }
@@ -317,11 +318,17 @@ class SqliteDedupStore implements DedupStore {
   }
 }
 
-/** A non-finite lease would be stored as NULL by SQLite (or never expire), silently breaking claims. */
+/** Claim leases must be exactly representable and never exceed the protocol's 24-hour bound. */
 function assertValidLease(leaseMinutes: number): void {
-  if (!Number.isFinite(leaseMinutes) || leaseMinutes <= 0) {
-    throw new RangeError(`[DedupStore] lease must be a positive finite number of minutes, got ${leaseMinutes}`);
+  const milliseconds = leaseMinutesToMs(leaseMinutes, 'lease');
+  if (milliseconds > MAX_EFFECTIVE_LEASE_MS) {
+    throw new RangeError(`[DedupStore] lease must not exceed ${MAX_EFFECTIVE_LEASE_MS} milliseconds`);
   }
+}
+
+/** Deduplication TTLs may exceed the claim cap, but must remain exact safe integer milliseconds. */
+function assertValidTtl(ttlMinutes: number): void {
+  leaseMinutesToMs(ttlMinutes, 'ttlMinutes');
 }
 
 /** In-process store (tests, or explicit opt-out of persistence). */
