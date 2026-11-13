@@ -220,7 +220,7 @@ The approved plan was executed on the isolated corrective branch with the follow
 1. **UNKNOWN observability:** added persisted `unknown_since`, an index on `(state, unknown_since)`, `unknownStats()`, and safe `getStatus()` fields for UNKNOWN count/oldest time and effective lease. No hash or owner token is exposed.
 2. **Response contract validation:** `BrainClient.save` now validates the full documented BrainEntry shape before the middleware can treat a 2xx response as confirmed. Malformed 2xx responses remain UNKNOWN.
 3. **Store-level duration enforcement:** claim leases are validated at the DedupStore boundary, capped at 86,400,000 ms, and must convert to exact safe integer milliseconds. Dedup TTLs must also produce a safe absolute expiry timestamp.
-4. **UNKNOWN resolution isolation:** `add()` cannot transition UNKNOWN. Only an owner-matching `commit()` after a contract-valid confirmed save can transition UNKNOWN to committed.
+4. **UNKNOWN resolution isolation:** `add()` has no owner-token overload and cannot transition UNKNOWN. `commit()` requires the matching owner and current `unknown` state; direct `pending -> committed` is rejected.
 5. **PR #8 compatibility decision:** silent normalization/fallback behavior was intentionally not copied because it conflicts with the approved strict `RangeError` policy. Compatible TTL, boundary, and 24-hour-cap intent is covered by stricter tests.
 6. **Verification:** CI red/green evidence and the exact verified code SHA are recorded in `docs/reviews/2026-11-13-claim-timeout-idempotency-verification.md`. The PR #5 two-process barrier test was compared byte-for-byte and preserved.
 
