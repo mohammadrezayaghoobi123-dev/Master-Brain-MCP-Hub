@@ -315,12 +315,20 @@ export class AutoMemoryMiddleware {
     sessionCounts: Record<string, number>;
     dedupSize: number;
     dedupBackend: 'sqlite' | 'memory';
+    unknownClaims: { count: number; oldestAt: number | null };
+    effectiveLeaseMs: number;
   } {
     return {
       config: { ...this.config },
       sessionCounts: Object.fromEntries(this.sessionEntries),
       dedupSize: this.dedup.size(),
       dedupBackend: this.dedup.backend,
+      unknownClaims: this.dedup.unknownStats(),
+      effectiveLeaseMs: deriveEffectiveLeaseMs(
+        this.config.claimLeaseMinutes,
+        this.config.analysisTimeoutMs,
+        this.brainTimeoutMs
+      ),
     };
   }
 
