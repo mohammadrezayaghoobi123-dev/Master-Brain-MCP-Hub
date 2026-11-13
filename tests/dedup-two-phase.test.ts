@@ -458,32 +458,99 @@ describe('SQLite multi-process atomicity', () => {
     const childScript = `
       import { createDedupStore } from './src/lib/dedup-store.ts';
       const store = createDedupStore(process.argv[1]);
-      const token = store.claim('cross-process-hash', 5);
-      process.stdout.write(token === null ? 'null' : token);
-      store.close();
+      process.stdout.write('READY\\n');
+      let input = '';
+      for await (const chunk of process.stdin) {
+        input += chunk.toString();
+        if (input.includes('\\n')) break;
+      }
+      if (input.trim() !== 'GO') {
+        store.close();
+        process.exitCode = 2;
+      } else {
+        const token = store.claim('cross-process-hash', 5);
+        process.stdout.write('RESULT:' + (token === null ? 'null' : token) + '\\n');
+        store.close();
+      }
     `;
 
-    const claimInChild = () =>
-      new Promise<string | null>((resolve, reject) => {
-        const child = spawn(
-          process.execPath,
-          ['--import', 'tsx', '--input-type=module', '-e', childScript, dbPath],
-          { cwd: process.cwd(), env: process.env, stdio: ['ignore', 'pipe', 'pipe'] }
-        );
-        let stdout = '';
-        let stderr = '';
-        child.stdout.setEncoding('utf8').on('data', (chunk: string) => (stdout += chunk));
-        child.stderr.setEncoding('utf8').on('data', (chunk: string) => (stderr += chunk));
-        child.once('error', reject);
-        child.once('close', (code) => {
-          if (code !== 0) return reject(new Error(`child claim failed (${code}): ${stderr}`));
-          resolve(stdout === 'null' ? null : stdout);
-        });
+    const children: ReturnType<typeof spawn>[] = [];
+    const startChild = () => {
+      const child = spawn(
+        process.execPath,
+        ['--import', 'tsx', '--input-type=module', '-e', childScript, dbPath],
+        { cwd: process.cwd(), env: process.env, stdio: ['pipe', 'pipe', 'pipe'] }
+      );
+      children.push(child);
+      let stdout = '';
+      let stderr = '';
+      let ready = false;
+      let resolveReady!: () => void;
+      let rejectReady!: (error: Error) => void;
+      let resolveResult!: (value: string | null) => void;
+      let rejectResult!: (error: Error) => void;
+      const readyPromise = new Promise<void>((resolve, reject) => {
+        resolveReady = resolve;
+        rejectReady = reject;
+      });
+      const resultPromise = new Promise<string | null>((resolve, reject) => {
+        resolveResult = resolve;
+        rejectResult = reject;
       });
 
-    const results = await Promise.all([claimInChild(), claimInChild()]);
-    expect(results.filter((token) => token !== null)).toHaveLength(1);
-    expect(results.filter((token) => token === null)).toHaveLength(1);
+      child.stdout.setEncoding('utf8').on('data', (chunk: string) => {
+        stdout += chunk;
+        const lines = stdout.split('\\n');
+        if (!ready && lines.includes('READY')) {
+          ready = true;
+          resolveReady();
+        }
+        const resultLine = lines.find((line) => line.startsWith('RESULT:'));
+        if (resultLine) resolveResult(resultLine.slice('RESULT:'.length) === 'null' ? null : resultLine.slice('RESULT:'.length));
+      });
+      child.stderr.setEncoding('utf8').on('data', (chunk: string) => (stderr += chunk));
+      child.once('error', (error) => {
+        rejectReady(error);
+        rejectResult(error);
+      });
+      child.once('close', (code) => {
+        if (code !== 0) {
+          const error = new Error(`child claim failed (${code}): ${stderr}`);
+          rejectReady(error);
+          rejectResult(error);
+        } else if (!stdout.split('\\n').some((line) => line.startsWith('RESULT:'))) {
+          rejectResult(new Error(`child exited without a claim result: ${stdout}`));
+        }
+      });
+      return { child, readyPromise, resultPromise };
+    };
+
+    const workers = [startChild(), startChild()];
+    const timeout = setTimeout(() => {
+      for (const worker of workers) worker.child.kill('SIGKILL');
+    }, 10_000);
+
+    try {
+      // Do not release either process until both independent SQLite clients are ready.
+      await Promise.all(workers.map((worker) => worker.readyPromise));
+      for (const worker of workers) worker.child.stdin.write('GO\\n');
+
+      const results = await Promise.all(workers.map((worker) => worker.resultPromise));
+      expect(results.filter((token) => token !== null)).toHaveLength(1);
+      expect(results.filter((token) => token === null)).toHaveLength(1);
+
+      const verification = createDedupStore(dbPath);
+      try {
+        expect(verification.status('cross-process-hash')).toBe('pending');
+      } finally {
+        verification.close();
+      }
+    } finally {
+      clearTimeout(timeout);
+      for (const worker of workers) {
+        if (worker.child.exitCode === null && !worker.child.killed) worker.child.kill('SIGTERM');
+      }
+    }
   });
 });
 
