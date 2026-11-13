@@ -540,3 +540,16 @@ describe('lease validation at the store boundary', () => {
   });
 
 });
+
+describe('Idempotency-Key header', () => {
+  it('sends the content hash so an idempotency-aware backend can collapse retries', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(okResponse());
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const mw = makeMw(createMemoryDedupStore());
+    await mw.processInteraction('req', 'res', SRC);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const init = fetchMock.mock.calls[0][1] as { headers: Record<string, string> };
+    expect(init.headers['Idempotency-Key']).toBe(HASH);
+    mw.close();
+  });
+});
