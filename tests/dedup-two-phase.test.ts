@@ -399,7 +399,7 @@ describe('ambiguous save outcome (response loss)', () => {
   });
 
   // The backend contract has no no-side-effects guarantee for HTTP errors.
-  // All HTTP failures remain ambiguous until the claim lease expires.
+  // Every dispatched failure remains quarantined until authoritative reconciliation.
   it.each([400, 401, 403, 404, 422, 429])('keeps the claim after HTTP %i (no non-persistence guarantee)', async (status) => {
     const fetchMock = vi
       .fn()
