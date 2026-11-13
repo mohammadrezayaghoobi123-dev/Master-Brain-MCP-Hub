@@ -37,7 +37,7 @@
 - `status(hash)` returns `unknown` while the quarantined record exists.
 - Keep the existing random owner token as a Hub-local compare-and-set capability. Do not claim downstream fencing.
 
-- [ ] **Step 1: Add focused failing tests**
+- [x] **Step 1: Add focused failing tests**
   - For Memory and SQLite: claim -> markUnknown -> advance clock beyond 24 hours -> purge -> status remains `unknown`; a new claim returns null.
   - Wrong owner cannot mark unknown.
   - Correct owner can mark unknown exactly once; repeated transition returns false.
@@ -47,11 +47,11 @@
   - SQLite restart preserves unknown state and owner.
   - Purge removes expired pending/committed rows but never unknown rows.
 
-- [ ] **Step 2: Verify the relevant failure**
+- [x] **Step 2: Verify the relevant failure**
   - Run: `npm run test:run -- tests/dedup-two-phase.test.ts`
   - Expected: TypeScript/API failures for the missing `markUnknown` method and failing assertions showing that current expiry/purge removes ambiguous rows and stale commit overwrites a successor.
 
-- [ ] **Step 3: Implement the minimum behavior**
+- [x] **Step 3: Implement the minimum behavior**
   - Add additive SQLite migration for the new `unknown` state; existing rows retain their current state and expiry semantics.
   - Represent unknown as non-expiring in store semantics; exclude it from expiry and purge predicates.
   - Implement owner-checked pending -> unknown compare-and-set in Memory and SQLite.
@@ -60,15 +60,15 @@
   - Keep release restricted to pending rows.
   - Keep schema migration idempotent and constructor cleanup intact.
 
-- [ ] **Step 4: Verify the focused pass**
+- [x] **Step 4: Verify the focused pass**
   - Run: `npm run test:run -- tests/dedup-two-phase.test.ts`
   - Expected: all focused Memory/SQLite state-transition, expiry, restart, and ownership tests pass.
 
-- [ ] **Step 5: Run the affected integration check**
+- [x] **Step 5: Run the affected integration check**
   - Run: `npm run typecheck`
   - Expected: no missing or incompatible DedupStore implementations.
 
-- [ ] **Step 6: Commit the passing deliverable**
+- [x] **Step 6: Commit the passing deliverable**
   - Commit only `src/lib/dedup-store.ts` and `tests/dedup-two-phase.test.ts`.
 
 ### Task 2: Integrate quarantine state with Auto-Memory dispatch
@@ -82,7 +82,7 @@
 - Immediately before `brain.save`, call `markUnknown(hash, reservationToken)`.
 - No network call is allowed unless that compare-and-set returns true.
 
-- [ ] **Step 1: Add focused failing tests**
+- [x] **Step 1: Add focused failing tests**
   - After simulated backend commit + lost response, advance beyond the lease and invoke the same interaction: second Brain dispatch count remains one; result is `outcome_unknown`; state remains unknown.
   - A malformed 2xx response, transport reset, timeout, and every HTTP error class already covered leave unknown state and never retry automatically.
   - If `markUnknown` returns false, `brain.save` is never called and the result is `claim_lost`.
@@ -90,11 +90,11 @@
   - If the process crashes after transition to unknown but before dispatch, the row remains quarantined; this is a deliberate conservative false-positive requiring reconciliation.
   - Remove or rewrite the existing test that expects a second backend write after lease expiry; assert one backend write attempt instead.
 
-- [ ] **Step 2: Verify the relevant failure**
+- [x] **Step 2: Verify the relevant failure**
   - Run: `npm run test:run -- tests/dedup-two-phase.test.ts`
   - Expected: current code fails because it retries after expiry and has no unknown result state.
 
-- [ ] **Step 3: Implement the minimum behavior**
+- [x] **Step 3: Implement the minimum behavior**
   - Query store status when claim acquisition fails; distinguish committed, pending, and unknown.
   - Mark unknown before dispatch and fail closed if ownership is lost.
   - Leave unknown untouched on any ambiguous outcome.
@@ -102,15 +102,15 @@
   - Remove the unsafe fallback that calls token-bearing `add` after a failed commit; log a high-severity local persistence error and retain unknown if commit cannot be confirmed.
   - Do not add an automatic unknown reset or new-key retry path.
 
-- [ ] **Step 4: Verify the focused pass**
+- [x] **Step 4: Verify the focused pass**
   - Run: `npm run test:run -- tests/dedup-two-phase.test.ts`
   - Expected: no second dispatch after ambiguous outcomes; pending pre-dispatch crash recovery still works.
 
-- [ ] **Step 5: Run the affected integration check**
+- [x] **Step 5: Run the affected integration check**
   - Run: `npm run test:run -- tests/dedup-two-phase.test.ts tests/auto-memory.test.ts`
   - Expected: Auto-Memory behavior remains compatible except for the intentionally changed ambiguous-outcome retry contract.
 
-- [ ] **Step 6: Commit the passing deliverable**
+- [x] **Step 6: Commit the passing deliverable**
   - Commit only `src/middleware/auto-memory.ts` and its focused tests.
 
 ### Task 3: Strict timeout parsing and effective lease cap
@@ -129,7 +129,7 @@
 - `BrainClient` throws `RangeError` for a supplied invalid timeout; omission uses 30,000 ms.
 - `AutoMemoryMiddleware` validates effective config atomically at construction and update.
 
-- [ ] **Step 1: Add focused failing tests**
+- [x] **Step 1: Add focused failing tests**
   - BrainClient: omitted timeout uses 30,000 ms; NaN, infinities, zero, negative, fractional, unsafe, and malformed supplied values throw RangeError.
   - Environment: absent BRAIN_TIMEOUT_MS uses default; supplied malformed/empty/zero/negative/unsafe values fail closed.
   - AutoMemory: analysis timeout and claim lease accept valid safe values; invalid values throw RangeError.
@@ -139,11 +139,11 @@
   - Invalid updateConfig leaves the prior effective config unchanged and does not mutate the caller's object.
   - Preserve the 1,000 ms scheduling/safety reserve as an explicit named constant; test the exact arithmetic.
 
-- [ ] **Step 2: Verify the relevant failure**
+- [x] **Step 2: Verify the relevant failure**
   - Run: `npm run test:run -- tests/brain-client.test.ts tests/dedup-two-phase.test.ts`
   - Expected: current implementation silently substitutes defaults and has no 24-hour cap, so the new RangeError and cap assertions fail.
 
-- [ ] **Step 3: Implement the minimum behavior**
+- [x] **Step 3: Implement the minimum behavior**
   - Add pure validation/parsing functions in `time-budget.ts`.
   - Distinguish omitted environment settings from supplied malformed settings.
   - Validate milliseconds as positive safe integers; validate minute-to-millisecond conversion for overflow and integral precision.
@@ -151,15 +151,15 @@
   - Validate a copied config object before replacing the active config; never mutate caller input.
   - Ensure BrainClient and AutoMemory consume the same parsed Brain timeout semantics.
 
-- [ ] **Step 4: Verify the focused pass**
+- [x] **Step 4: Verify the focused pass**
   - Run: `npm run test:run -- tests/brain-client.test.ts tests/dedup-two-phase.test.ts`
   - Expected: all strict-boundary, environment parsing, atomic-update, and exact-cap tests pass.
 
-- [ ] **Step 5: Run the affected integration check**
+- [x] **Step 5: Run the affected integration check**
   - Run: `npm run typecheck && npm run build`
   - Expected: clean typecheck and build.
 
-- [ ] **Step 6: Commit the passing deliverable**
+- [x] **Step 6: Commit the passing deliverable**
   - Commit only the shared time-budget helper, client/config code, types, and corresponding tests.
 
 ### Task 4: Full Hub regression, branch comparison, and evidence record
@@ -172,34 +172,34 @@
 - Evidence record identifies exact branch/head SHA, CI run IDs, commands, exit results, test totals, and unresolved Runtime gates.
 - The review record distinguishes Hub-local guarantees from Runtime guarantees.
 
-- [ ] **Step 1: Add verification checklist**
+- [x] **Step 1: Add verification checklist**
   - Record exact expected properties: no ambiguous retry, unknown survives restart/purge, stale owner cannot overwrite, exact lease cap, strict config validation, legacy migration compatibility, and unchanged PR #5 barrier test.
 
-- [ ] **Step 2: Run full verification**
+- [x] **Step 2: Run full verification**
   - Run: `npm run typecheck`
   - Run: `npm run test:run`
   - Run: `npm run build`
   - Run: `npm audit --audit-level=moderate`
   - Expected: zero failures and zero audit findings at the configured threshold.
 
-- [ ] **Step 3: Verify exact-SHA CI**
+- [x] **Step 3: Verify exact-SHA CI**
   - Open a draft PR from this branch to `fix/integration-regressions-pr4-2026-11-13` only after the test-first commits exist.
   - Verify all Node 22/24/26 quality jobs and dependency audit on the exact final head SHA.
   - Record run IDs and results; do not infer results from an earlier SHA.
 
-- [ ] **Step 4: Verify branch preservation**
+- [x] **Step 4: Verify branch preservation**
   - Compare the corrective branch against PR #5 and PR #8.
   - Confirm the PR #5 barrier test and constructor cleanup remain present.
   - Confirm PR #8 useful timeout-boundary cases are retained where compatible.
   - Confirm PR #5, PR #8, main, and Runtime branches were not modified.
 
-- [ ] **Step 5: Record unresolved Runtime gate**
+- [x] **Step 5: Record unresolved Runtime gate**
   - The inspected `Activi-AI/The-Brain` implementation exposes `POST /api/memory/store`, performs direct INSERT, has no idempotency table/constraint, and has no real test suite.
   - Hub currently targets `/api/brain/entries`; deployed endpoint identity is unverified.
   - Runtime repository is read-only to the connected identity; no Runtime code change or deployment is allowed.
   - Set Runtime idempotency and end-to-end exactly-once to `UNVERIFIED`; do not mark Gate B or Gate C PASS.
 
-- [ ] **Step 6: Commit verification evidence**
+- [x] **Step 6: Commit verification evidence**
   - Commit only the specification amendment and verification record.
 
 ---
@@ -211,3 +211,17 @@
 3. **Unknown-state reconciliation:** The inspected Runtime exposes no idempotency lookup or reconciliation endpoint. Until one is implemented and verified, unknown rows intentionally remain quarantined; no automatic retry is safe.
 4. **Independent reviewer:** Claude review is unavailable due to the stated usage restriction. Internal adversarial review and CI evidence can proceed, but neither will be represented as an independent third-party approval.
 5. **Merge/deploy:** This plan does not authorize merging any PR or deploying any Runtime or Hub service.
+
+
+## Execution updates (2026-11-13)
+
+The approved plan was executed on the isolated corrective branch with the following precision additions:
+
+1. **UNKNOWN observability:** added persisted `unknown_since`, an index on `(state, unknown_since)`, `unknownStats()`, and safe `getStatus()` fields for UNKNOWN count/oldest time and effective lease. No hash or owner token is exposed.
+2. **Response contract validation:** `BrainClient.save` now validates the full documented BrainEntry shape before the middleware can treat a 2xx response as confirmed. Malformed 2xx responses remain UNKNOWN.
+3. **Store-level duration enforcement:** claim leases are validated at the DedupStore boundary, capped at 86,400,000 ms, and must convert to exact safe integer milliseconds. Dedup TTLs must also produce a safe absolute expiry timestamp.
+4. **UNKNOWN resolution isolation:** `add()` cannot transition UNKNOWN. Only an owner-matching `commit()` after a contract-valid confirmed save can transition UNKNOWN to committed.
+5. **PR #8 compatibility decision:** silent normalization/fallback behavior was intentionally not copied because it conflicts with the approved strict `RangeError` policy. Compatible TTL, boundary, and 24-hour-cap intent is covered by stricter tests.
+6. **Verification:** CI red/green evidence and the exact verified code SHA are recorded in `docs/reviews/2026-11-13-claim-timeout-idempotency-verification.md`. The PR #5 two-process barrier test was compared byte-for-byte and preserved.
+
+**Completion boundary:** Hub-local implementation and CI are complete. Runtime idempotency, deployed endpoint compatibility, and authoritative UNKNOWN reconciliation remain explicit external blockers; they are not marked PASS.
