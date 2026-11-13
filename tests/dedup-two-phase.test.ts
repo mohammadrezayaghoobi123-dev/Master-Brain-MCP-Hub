@@ -526,3 +526,17 @@ describe('SQLite unavailable (controlled)', () => {
     }
   });
 });
+describe('lease validation at the store boundary', () => {
+  it.each([
+    ['memory', () => createMemoryDedupStore()],
+    ['sqlite', () => createDedupStore(dbPath)],
+  ])('rejects a non-finite or non-positive lease instead of silently no-oping (%s)', (_name, make) => {
+    const store = make();
+    for (const bad of [Number.NaN, Infinity, 0, -1]) {
+      expect(() => store.claim('bad-lease', bad)).toThrow('lease must be');
+    }
+    expect(store.status('bad-lease')).toBeNull();
+    store.close();
+  });
+
+});
