@@ -217,11 +217,12 @@ describe.each([
     expect(store.claim('h', 1)).toBeNull();
   });
 
-  it('add cannot overwrite a live pending reservation', () => {
+  it('add cannot overwrite a live pending or unknown reservation', () => {
     const owner = store.claim('h', 5)!;
     store.add('h', 30);
     expect(store.status('h')).toBe('pending');
     expect(store.markUnknown('h', owner)).toBe(true);
+    store.add('h', 30);
     expect(store.status('h')).toBe('unknown');
   });
 
