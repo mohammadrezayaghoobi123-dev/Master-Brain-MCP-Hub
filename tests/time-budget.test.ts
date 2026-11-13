@@ -38,7 +38,7 @@ describe('time budget validation', () => {
     expect(deriveEffectiveLeaseMs(1, analysis, 30_000)).toBe(MAX_EFFECTIVE_LEASE_MS);
   });
 
-  it.each([Number.NaN, Infinity, -Infinity, 0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1])(
+  it.each([Number.NaN, Infinity, -Infinity, 0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, 2_147_483_648, Number.MAX_VALUE])(
     'rejects invalid millisecond budget %s',
     (value) => {
       expect(() => deriveEffectiveLeaseMs(1, value, 30_000)).toThrow(RangeError);
@@ -62,7 +62,7 @@ describe('time budget validation', () => {
     expect(parsePositiveSafeIntegerEnv('BRAIN_TIMEOUT_MS', DEFAULT_BRAIN_TIMEOUT_MS)).toBe(30_000);
   });
 
-  it.each(['', 'abc', '0', '-1', '1.5', '1e3', '9007199254740992'])(
+  it.each(['', 'abc', '0', '-1', '1.5', '1e3', '2147483648', '9007199254740992'])(
     'rejects malformed or unsafe BRAIN_TIMEOUT_MS value %j',
     (raw) => {
       process.env.BRAIN_TIMEOUT_MS = raw;
