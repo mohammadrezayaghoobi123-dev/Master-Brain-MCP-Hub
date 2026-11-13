@@ -91,15 +91,83 @@ describe.each([
     expect(store.has('h')).toBe(true);
   });
 
-  it('a pending claim expires with its lease (crash recovery) and can be re-claimed', () => {
+  it('an unknown outcome never expires, is never purged, and blocks a new claim', () => {
+    const owner = store.claim('h', 1)!;
+    expect(store.markUnknown('h', owner)).toBe(true);
+    advance(25 * 60 * MIN);
+    expect(store.purgeExpired()).toBe(0);
+    expect(store.status('h')).toBe('unknown');
+    expect(store.claim('h', 1)).toBeNull();
+    store.release('h', owner);
+    expect(store.status('h')).toBe('unknown');
+  });
+
+  it('only the current owner can transition pending to unknown', () => {
+    const owner = store.claim('h', 1)!;
+    expect(store.markUnknown('h', 'not-the-owner')).toBe(false);
+    expect(store.status('h')).toBe('pending');
+    expect(store.markUnknown('h', owner)).toBe(true);
+    expect(store.markUnknown('h', owner)).toBe(false);
+    expect(store.status('h')).toBe('unknown');
+  });
+
+  it('the matching owner can commit an unknown outcome after confirmed persistence', () => {
+    const owner = store.claim('h', 1)!;
+    expect(store.markUnknown('h', owner)).toBe(true);
+    expect(store.commit('h', owner, 30)).toBe(true);
+    expect(store.status('h')).toBe('committed');
+  });
+
+  it('cannot skip the pending-to-unknown transition when committing', () => {
+    const owner = store.claim('pending-commit', 5)!;
+    expect(store.commit('pending-commit', owner, 30)).toBe(false);
+    expect(store.status('pending-commit')).toBe('pending');
+  });
+
+  it('reports unknown quarantine count and oldest timestamp', () => {
+    const first = store.claim('unknown-1', 5)!;
+    expect(store.markUnknown('unknown-1', first)).toBe(true);
+    advance(MIN);
+    const second = store.claim('unknown-2', 5)!;
+    expect(store.markUnknown('unknown-2', second)).toBe(true);
+    expect(store.unknownStats()).toEqual({ count: 2, oldestAt: T0 });
+    expect(store.commit('unknown-1', first, 30)).toBe(true);
+    expect(store.unknownStats()).toEqual({ count: 1, oldestAt: T0 + MIN });
+  });
+
+  it('rejects invalid commit and add TTL values without changing current state', () => {
+    const owner = store.claim('ttl', 5)!;
+    expect(() => store.commit('ttl', owner, Number.NaN)).toThrow(RangeError);
+    expect(() => store.commit('ttl', owner, 0.000001)).toThrow(RangeError);
+    expect(() => store.add('other', 0)).toThrow(RangeError);
+    expect(() => store.add('other', Number.MAX_VALUE)).toThrow(RangeError);
+    expect(store.status('ttl')).toBe('pending');
+  });
+
+  it('cannot use add() to resolve an UNKNOWN quarantine', () => {
+    const owner = store.claim('unknown-add', 5)!;
+    expect(store.markUnknown('unknown-add', owner)).toBe(true);
+    store.add('unknown-add', 30);
+    expect(store.status('unknown-add')).toBe('unknown');
+  });
+
+  it('does not expose an owner-token overload that bypasses UNKNOWN transitions', () => {
+    const owner = store.claim('no-add-owner', 5)!;
+    // @ts-expect-error add() is intentionally ownerless; commit() is the only owner-bound finalizer.
+    store.add('no-add-owner', 30, owner);
+    expect(store.status('no-add-owner')).toBe('pending');
+  });
+
+  it('a pending claim expires with its lease (crash before dispatch) and can be re-claimed', () => {
     store.claim('h', 1);
     advance(MIN + 1);
     expect(store.status('h')).toBeNull();
     expect(store.claim('h', 1)).toEqual(expect.any(String));
   });
 
-  it('commit promotes pending to committed with the long TTL', () => {
+  it('commit promotes unknown to committed with the long TTL', () => {
     const token = store.claim('h', 1)!;
+    expect(store.markUnknown('h', token)).toBe(true);
     expect(store.commit('h', token, 30)).toBe(true);
     expect(store.status('h')).toBe('committed');
     advance(10 * MIN); // far beyond the original lease
@@ -108,23 +176,22 @@ describe.each([
     expect(store.status('h')).toBeNull();
   });
 
-  it('a confirmed stale save supersedes a successor lease and remains committed if that successor releases', () => {
+  it('a stale confirmed save cannot overwrite a successor claim', () => {
     const stale = store.claim('h', 1)!;
     advance(MIN + 1);
     const successor = store.claim('h', 5)!;
-    expect(store.commit('h', stale, 30)).toBe(false); // caller lost lease ownership
-    expect(store.status('h')).toBe('committed'); // but the backend save was confirmed
-    store.release('h', successor); // successor failed before saving
-    expect(store.status('h')).toBe('committed');
-    expect(store.claim('h', 1)).toBeNull();
+    expect(store.commit('h', stale, 30)).toBe(false);
+    expect(store.status('h')).toBe('pending');
+    store.release('h', successor);
+    expect(store.status('h')).toBeNull();
   });
 
-  it('records a stale durable save after lease expiry when no successor owns the key', () => {
+  it('does not resurrect an expired claim from a stale owner commit', () => {
     const stale = store.claim('expired-h', 1)!;
     advance(MIN + 1);
     store.purgeExpired();
     expect(store.commit('expired-h', stale, 30)).toBe(false);
-    expect(store.status('expired-h')).toBe('committed');
+    expect(store.status('expired-h')).toBeNull();
   });
 
   it('release only removes the caller\'s own pending claim', () => {
@@ -139,6 +206,7 @@ describe.each([
 
   it('a committed entry cannot be released', () => {
     const token = store.claim('h', 1)!;
+    store.markUnknown('h', token);
     store.commit('h', token, 30);
     store.release('h', token);
     expect(store.status('h')).toBe('committed');
@@ -150,40 +218,51 @@ describe.each([
     expect(store.claim('h', 1)).toBeNull();
   });
 
-  it('add can promote only the matching pending owner during recovery', () => {
+  it('add cannot overwrite a live pending or unknown reservation', () => {
     const owner = store.claim('h', 5)!;
-    store.add('h', 30, owner);
-    expect(store.status('h')).toBe('committed');
+    store.add('h', 30);
+    expect(store.status('h')).toBe('pending');
+    expect(store.markUnknown('h', owner)).toBe(true);
+    store.add('h', 30);
+    expect(store.status('h')).toBe('unknown');
   });
 
-  it('owner-aware post-save recovery records committed even after a successor lease starts', () => {
-    const stale = store.claim('h', 1)!;
+  it('ownerless add cannot overwrite a successor lease', () => {
+    store.claim('h', 1);
     advance(MIN + 1);
     const successor = store.claim('h', 5)!;
-    store.add('h', 30, stale);
-    expect(store.status('h')).toBe('committed');
+    store.add('h', 30);
+    expect(store.status('h')).toBe('pending');
     store.release('h', successor);
-    expect(store.status('h')).toBe('committed');
+    expect(store.status('h')).toBeNull();
   });
 
   it('add cannot overwrite a live pending reservation', () => {
     const owner = store.claim('h', 5)!;
     store.add('h', 30);
     expect(store.status('h')).toBe('pending');
+    expect(store.markUnknown('h', owner)).toBe(true);
     expect(store.commit('h', owner, 30)).toBe(true);
     expect(store.status('h')).toBe('committed');
   });
 });
 
 describe('SQLite two-phase persistence', () => {
-  it('pending and committed entries survive a restart (reopen)', () => {
+  it('pending, unknown, and committed entries survive a restart (reopen)', () => {
     const a = createDedupStore(dbPath);
     a.claim('pending-hash', 5);
-    a.commit('committed-hash', a.claim('committed-hash', 5)!, 30);
+    const unknownOwner = a.claim('unknown-hash', 5)!;
+    expect(a.markUnknown('unknown-hash', unknownOwner)).toBe(true);
+    const committedOwner = a.claim('committed-hash', 5)!;
+    a.markUnknown('committed-hash', committedOwner);
+    a.commit('committed-hash', committedOwner, 30);
     a.close();
 
     const b = createDedupStore(dbPath);
     expect(b.status('pending-hash')).toBe('pending');
+    expect(b.status('unknown-hash')).toBe('unknown');
+    expect(b.unknownStats()).toEqual({ count: 1, oldestAt: T0 });
+    expect(b.claim('unknown-hash', 5)).toBeNull();
     expect(b.status('committed-hash')).toBe('committed');
     b.close();
   });
@@ -244,36 +323,64 @@ describe('crash between claim and save (shared SQLite file)', () => {
 });
 
 describe('ambiguous save outcome (response loss)', () => {
-  it('keeps the claim after a timeout and retries only after the lease', async () => {
+  it('does not dispatch when the pending claim expires before UNKNOWN transition', async () => {
+    const store = createMemoryDedupStore();
+    const markUnknown = store.markUnknown.bind(store);
+    vi.spyOn(store, 'markUnknown').mockImplementation((hash, token) => {
+      advance(3 * MIN);
+      return markUnknown(hash, token);
+    });
+    const fetchMock = vi.fn().mockResolvedValue(okResponse());
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const mw = makeMw(store);
+
+    await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({
+      saved: false,
+      reason: 'claim_lost',
+      retryable: false,
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(store.status(HASH)).toBeNull();
+    mw.close();
+  });
+
+  it('does not dispatch when durable UNKNOWN transition throws', async () => {
+    const store = createMemoryDedupStore();
+    vi.spyOn(store, 'markUnknown').mockImplementation(() => {
+      throw new Error('sqlite write failure');
+    });
+    const fetchMock = vi.fn().mockResolvedValue(okResponse());
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const mw = makeMw(store);
+
+    await expect(mw.processInteraction('req', 'res', SRC)).rejects.toThrow('sqlite write failure');
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(store.status(HASH)).toBeNull();
+    mw.close();
+  });
+  it('keeps an ambiguous timeout quarantined beyond the original lease', async () => {
     const fetchMock = vi
       .fn()
       .mockRejectedValueOnce(Object.assign(new Error('aborted'), { name: 'AbortError' }))
       .mockResolvedValue(okResponse());
+    const store = createMemoryDedupStore();
     global.fetch = fetchMock as unknown as typeof fetch;
-    const mw = makeMw(createMemoryDedupStore());
+    const mw = makeMw(store);
 
     await expect(mw.processInteraction('req', 'res', SRC)).rejects.toMatchObject({ code: 'TIMEOUT' });
+    expect(store.status(HASH)).toBe('unknown');
 
-    // the brain may already have stored it: an immediate retry must not create a second entry
+    advance(25 * 60 * MIN);
     await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({
       saved: false,
-      reason: 'duplicate_in_flight',
-      retryable: true,
+      reason: 'outcome_unknown',
+      retryable: false,
     });
     expect(fetchMock).toHaveBeenCalledTimes(1);
-
-    advance(3 * MIN);
-    await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({ saved: true });
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-
     mw.close();
   });
 
-  it('documents the unresolved duplicate-write risk after a save commits but its response is lost', async () => {
-    // Simulate a backend that commits the first POST, then the network drops
-    // the response. The Hub cannot distinguish this from a request that never
-    // reached the backend. After the pending lease expires it retries; without
-    // a server-side idempotency key, the backend can persist the same entry twice.
+  it('does not retry a possibly committed write after its response is lost', async () => {
     const backendWrites: string[] = [];
     const fetchMock = vi.fn()
       .mockImplementationOnce(async (_url: string, init: RequestInit) => {
@@ -284,22 +391,37 @@ describe('ambiguous save outcome (response loss)', () => {
         backendWrites.push(String(init.body));
         return okResponse();
       });
+    const store = createMemoryDedupStore();
     global.fetch = fetchMock as unknown as typeof fetch;
-    const mw = makeMw(createMemoryDedupStore());
+    const mw = makeMw(store);
 
     await expect(mw.processInteraction('req', 'res', SRC)).rejects.toBeDefined();
+    expect(store.status(HASH)).toBe('unknown');
+
+    advance(25 * 60 * MIN);
     await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({
       saved: false,
-      reason: 'duplicate_in_flight',
-      retryable: true,
+      reason: 'outcome_unknown',
+      retryable: false,
     });
     expect(backendWrites).toHaveLength(1);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    mw.close();
+  });
 
-    advance(3 * MIN);
-    await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({ saved: true });
-    expect(backendWrites).toHaveLength(2);
-    expect(backendWrites[0]).toBe(backendWrites[1]);
-
+  it('keeps UNKNOWN when a 2xx response body violates the BrainEntry contract', async () => {
+    const store = createMemoryDedupStore();
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 201,
+      json: async () => ({ ok: true }),
+    }) as unknown as typeof fetch;
+    const mw = makeMw(store);
+    await expect(mw.processInteraction('req', 'res', SRC)).rejects.toMatchObject({
+      code: 'BRAIN_HTTP_ERROR',
+    });
+    expect(store.status(HASH)).toBe('unknown');
+    expect(mw.getStatus().unknownClaims.count).toBe(1);
     mw.close();
   });
 
@@ -316,7 +438,8 @@ describe('ambiguous save outcome (response loss)', () => {
 
     await expect(mw.processInteraction('req', 'res', SRC)).rejects.toBeDefined();
     await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({
-      reason: 'duplicate_in_flight',
+      reason: 'outcome_unknown',
+      retryable: false,
     });
     expect(fetchMock).toHaveBeenCalledTimes(1);
     mw.close();
@@ -333,14 +456,15 @@ describe('ambiguous save outcome (response loss)', () => {
 
     await expect(mw.processInteraction('req', 'res', SRC)).rejects.toBeDefined();
     await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({
-      reason: 'duplicate_in_flight',
+      reason: 'outcome_unknown',
+      retryable: false,
     });
     expect(fetchMock).toHaveBeenCalledTimes(1);
     mw.close();
   });
 
   // The backend contract has no no-side-effects guarantee for HTTP errors.
-  // All HTTP failures remain ambiguous until the claim lease expires.
+  // Every dispatched failure remains quarantined until authoritative reconciliation.
   it.each([400, 401, 403, 404, 422, 429])('keeps the claim after HTTP %i (no non-persistence guarantee)', async (status) => {
     const fetchMock = vi
       .fn()
@@ -352,8 +476,8 @@ describe('ambiguous save outcome (response loss)', () => {
     await expect(mw.processInteraction('req', 'res', SRC)).rejects.toBeDefined();
     await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({
       saved: false,
-      reason: 'duplicate_in_flight',
-      retryable: true,
+      reason: 'outcome_unknown',
+      retryable: false,
     });
     expect(fetchMock).toHaveBeenCalledTimes(1);
     mw.close();
@@ -361,7 +485,7 @@ describe('ambiguous save outcome (response loss)', () => {
 });
 
 describe('concurrent identical interactions where the first save response is an HTTP error', () => {
-  it('tells the loser it may retry; this client-side test does not prove backend exactly-once', async () => {
+  it('keeps the first dispatched request quarantined after an ambiguous HTTP error', async () => {
     let releaseAnalysis!: () => void;
     const gate = new Promise<void>((r) => (releaseAnalysis = r));
     const fetchMock = vi
@@ -388,13 +512,17 @@ describe('concurrent identical interactions where the first save response is an 
 
     await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({
       saved: false,
-      reason: 'duplicate_in_flight',
-      retryable: true,
+      reason: 'outcome_unknown',
+      retryable: false,
     });
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    advance(3 * MIN);
-    await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({ saved: true });
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    advance(25 * 60 * MIN);
+    await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({
+      saved: false,
+      reason: 'outcome_unknown',
+      retryable: false,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
     mw.close();
   });
 });
@@ -577,15 +705,40 @@ describe('SQLite constructor cleanup', () => {
 });
 
 describe('lease configuration validation', () => {
-  it('uses finite positive defaults when lease or timeout configuration is invalid', () => {
-    const mw = makeMw(createMemoryDedupStore(), {
-      claimLeaseMinutes: Number.NaN,
-      analysisTimeoutMs: Number.POSITIVE_INFINITY,
-    });
+  it.each([
+    { claimLeaseMinutes: Number.NaN },
+    { claimLeaseMinutes: Number.POSITIVE_INFINITY },
+    { claimLeaseMinutes: 0 },
+    { claimLeaseMinutes: -1 },
+    { claimLeaseMinutes: 1440.001 },
+    { deduplicationWindowMinutes: Number.NaN },
+    { deduplicationWindowMinutes: Number.POSITIVE_INFINITY },
+    { deduplicationWindowMinutes: 0 },
+    { deduplicationWindowMinutes: -1 },
+    { deduplicationWindowMinutes: 0.000001 },
+    { analysisTimeoutMs: Number.NaN },
+    { analysisTimeoutMs: Number.POSITIVE_INFINITY },
+    { analysisTimeoutMs: 0 },
+    { analysisTimeoutMs: -1 },
+    { analysisTimeoutMs: 1.5 },
+  ])('rejects invalid time configuration %#', (invalidConfig) => {
+    expect(
+      () => new AutoMemoryMiddleware({ enabled: true, ...invalidConfig } as any, createMemoryDedupStore())
+    ).toThrow(RangeError);
+  });
+
+  it.each([
+    { analysisTimeoutMs: Number.POSITIVE_INFINITY },
+    { deduplicationWindowMinutes: Number.NaN },
+    { claimLeaseMinutes: 1441 },
+  ])('keeps the prior valid configuration when updateConfig rejects %#', (supplied) => {
+    const mw = makeMw(createMemoryDedupStore());
+    const before = mw.getStatus().config;
+    const original = { ...supplied };
     try {
-      const lease = (mw as any).effectiveLeaseMinutes();
-      expect(Number.isFinite(lease)).toBe(true);
-      expect(lease).toBeGreaterThan(0);
+      expect(() => mw.updateConfig(supplied)).toThrow(RangeError);
+      expect(mw.getStatus().config).toEqual(before);
+      expect(supplied).toEqual(original);
     } finally {
       mw.close();
     }
@@ -633,51 +786,12 @@ describe('SQLite unavailable (controlled)', () => {
 });
 
 describe('Auto-Memory analysis timeout validation', () => {
-  it.each([Number.NaN, Number.POSITIVE_INFINITY, 0, -1])(
-    'passes a finite positive timeout to the Anthropic SDK for invalid config %s',
-    async (analysisTimeoutMs) => {
-      const fetchMock = vi.fn().mockResolvedValue(okResponse());
-      global.fetch = fetchMock as unknown as typeof fetch;
-      const mw = makeMw(createMemoryDedupStore(), { analysisTimeoutMs });
-      const create = vi.fn().mockResolvedValue({
-        content: [{ type: 'text', text: JSON.stringify(analysis) }],
-      });
-      vi.spyOn(mw as any, 'analyzeImportance').mockRestore();
-      vi.spyOn(mw as any, 'getAnthropic').mockReturnValue({ messages: { create } });
-
-      try {
-        await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({ saved: true });
-        expect(create).toHaveBeenCalledWith(
-          expect.any(Object),
-          expect.objectContaining({ timeout: 60_000, maxRetries: 0 })
-        );
-        expect(fetchMock).toHaveBeenCalledTimes(1);
-      } finally {
-        mw.close();
-      }
+  it.each([Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, 2_147_483_648, Number.MAX_VALUE])(
+    'rejects invalid analysis timeout %s',
+    (analysisTimeoutMs) => {
+      expect(() => new AutoMemoryMiddleware({ enabled: true, analysisTimeoutMs })).toThrow(RangeError);
     }
   );
-
-  it('normalizes an invalid timeout supplied through updateConfig before the next analysis', async () => {
-    global.fetch = vi.fn().mockResolvedValue(okResponse()) as unknown as typeof fetch;
-    const mw = makeMw(createMemoryDedupStore());
-    const create = vi.fn().mockResolvedValue({
-      content: [{ type: 'text', text: JSON.stringify(analysis) }],
-    });
-    vi.spyOn(mw as any, 'analyzeImportance').mockRestore();
-    vi.spyOn(mw as any, 'getAnthropic').mockReturnValue({ messages: { create } });
-    mw.updateConfig({ analysisTimeoutMs: Number.POSITIVE_INFINITY });
-
-    try {
-      await mw.processInteraction('req', 'res', SRC);
-      expect(create).toHaveBeenCalledWith(
-        expect.any(Object),
-        expect.objectContaining({ timeout: 60_000, maxRetries: 0 })
-      );
-    } finally {
-      mw.close();
-    }
-  });
 });
 
 describe('lease validation at the store boundary', () => {
@@ -686,8 +800,8 @@ describe('lease validation at the store boundary', () => {
     ['sqlite', () => createDedupStore(dbPath)],
   ])('rejects a non-finite or non-positive lease instead of silently no-oping (%s)', (_name, make) => {
     const store = make();
-    for (const bad of [Number.NaN, Infinity, 0, -1]) {
-      expect(() => store.claim('bad-lease', bad)).toThrow('lease must be');
+    for (const bad of [Number.NaN, Infinity, 0, -1, 0.000001, 1440.001, Number.MAX_VALUE]) {
+      expect(() => store.claim('bad-lease', bad)).toThrow(RangeError);
     }
     expect(store.status('bad-lease')).toBeNull();
     store.close();

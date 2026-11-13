@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { BrainClient } from '../src/brain/client.js';
+import { BrainClient, _resetBrainClientForTests, getBrainClient } from '../src/brain/client.js';
 import { AppError } from '../src/lib/errors.js';
 
 describe('BrainClient', () => {
@@ -78,6 +78,35 @@ describe('BrainClient — API calls', () => {
     expect(result.id).toBe('123');
   });
 
+  it.each([
+    { ok: true },
+    { id: 'missing-required-fields' },
+    {
+      id: '123',
+      type: 'not-a-memory-type',
+      content: 'Test content',
+      tags: [],
+      timestamp: new Date().toISOString(),
+      source: { tool: 'claude-code' },
+    },
+    {
+      id: '123',
+      type: 'decision',
+      content: 'Test content',
+      tags: [],
+      timestamp: 'not-a-date',
+      source: { tool: 'claude-code' },
+    },
+  ])('rejects malformed 2xx BrainEntry response %#', async (body) => {
+    mockFetch.mockResolvedValueOnce({ ok: true, status: 201, json: async () => body });
+    await expect(client.save({
+      type: 'decision',
+      content: 'Test content',
+      tags: ['test'],
+      source: { tool: 'claude-code' },
+    })).rejects.toMatchObject({ code: 'BRAIN_HTTP_ERROR' });
+  });
+
   it('throws AppError BRAIN_HTTP_ERROR on 500', async () => {
     mockFetch.mockResolvedValueOnce({
       ok: false,
@@ -91,28 +120,50 @@ describe('BrainClient — API calls', () => {
 
 
 describe('BrainClient timeout validation', () => {
-  it.each([Number.NaN, Number.POSITIVE_INFINITY, 0, -1])(
-    'uses the 30-second default for invalid timeout %s',
-    async (timeoutMs) => {
-      let scheduledDelay: number | undefined;
-      const timerSpy = vi.spyOn(globalThis, 'setTimeout').mockImplementation(((
-        _handler: TimerHandler,
-        timeout?: number
-      ) => {
-        scheduledDelay = Number(timeout);
-        return 0 as unknown as ReturnType<typeof setTimeout>;
-      }) as typeof setTimeout);
-      global.fetch = vi.fn().mockResolvedValue({
-        ok: true,
-        json: async () => ({ totalEntries: 0 }),
-      }) as unknown as typeof fetch;
+  it('uses the documented 30-second default only when timeout is omitted', async () => {
+    let scheduledDelay: number | undefined;
+    const timerSpy = vi.spyOn(globalThis, 'setTimeout').mockImplementation(((
+      _handler: TimerHandler,
+      timeout?: number
+    ) => {
+      scheduledDelay = Number(timeout);
+      return 0 as unknown as ReturnType<typeof setTimeout>;
+    }) as typeof setTimeout);
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ totalEntries: 0 }),
+    }) as unknown as typeof fetch;
 
+    try {
+      const client = new BrainClient({ baseUrl: 'http://localhost:3001' });
+      await client.stats();
+      expect(scheduledDelay).toBe(30_000);
+    } finally {
+      timerSpy.mockRestore();
+    }
+  });
+
+  it.each([Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1])(
+    'rejects invalid supplied timeout %s instead of silently normalizing it',
+    (timeoutMs) => {
+      expect(() => new BrainClient({ baseUrl: 'http://localhost:3001', timeoutMs })).toThrow(RangeError);
+    }
+  );
+});
+
+describe('BRAIN_TIMEOUT_MS environment validation', () => {
+  it.each(['', 'abc', '0', '-1', '1.5', '2147483648', '9007199254740992'])(
+    'fails closed for supplied invalid BRAIN_TIMEOUT_MS=%j',
+    (raw) => {
+      const previous = process.env.BRAIN_TIMEOUT_MS;
       try {
-        const invalidClient = new BrainClient({ baseUrl: 'http://localhost:3001', timeoutMs });
-        await invalidClient.stats();
-        expect(scheduledDelay).toBe(30_000);
+        process.env.BRAIN_TIMEOUT_MS = raw;
+        _resetBrainClientForTests();
+        expect(() => getBrainClient()).toThrow(RangeError);
       } finally {
-        timerSpy.mockRestore();
+        _resetBrainClientForTests();
+        if (previous === undefined) delete process.env.BRAIN_TIMEOUT_MS;
+        else process.env.BRAIN_TIMEOUT_MS = previous;
       }
     }
   );

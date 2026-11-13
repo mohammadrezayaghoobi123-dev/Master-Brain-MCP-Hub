@@ -18,6 +18,14 @@ import { getBrainClient } from '../brain/client.js';
 import { contentHash } from '../lib/hash.js';
 import { createDedupStore, type DedupStore } from '../lib/dedup-store.js';
 import { AppError } from '../lib/errors.js';
+import {
+  DEFAULT_ANALYSIS_TIMEOUT_MS,
+  DEFAULT_BRAIN_TIMEOUT_MS,
+  deriveEffectiveLeaseMs,
+  leaseMinutesToMs,
+  parsePositiveSafeIntegerEnv,
+  assertPositiveSafeIntegerMs,
+} from '../lib/time-budget.js';
 
 const analysisSchema = z.object({
   isImportant: z.boolean(),
@@ -28,8 +36,11 @@ const analysisSchema = z.object({
   context: z.string().max(500).optional(),
 });
 
-function finitePositiveTimeout(value: unknown, fallback: number): number {
-  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback;
+function validateTimeConfig(config: AutoMemoryConfig, brainTimeoutMs: number): void {
+  assertPositiveSafeIntegerMs(config.analysisTimeoutMs, 'analysisTimeoutMs');
+  leaseMinutesToMs(config.claimLeaseMinutes, 'claimLeaseMinutes');
+  leaseMinutesToMs(config.deduplicationWindowMinutes, 'deduplicationWindowMinutes');
+  deriveEffectiveLeaseMs(config.claimLeaseMinutes, config.analysisTimeoutMs, brainTimeoutMs);
 }
 
 const DEFAULT_CONFIG: AutoMemoryConfig = {
@@ -39,12 +50,13 @@ const DEFAULT_CONFIG: AutoMemoryConfig = {
   maxEntriesPerSession: 50,
   deduplicationWindowMinutes: 30,
   claimLeaseMinutes: 2,
-  analysisTimeoutMs: 60_000,
+  analysisTimeoutMs: DEFAULT_ANALYSIS_TIMEOUT_MS,
   analysisModel: process.env.AUTO_MEMORY_MODEL || 'claude-3-5-haiku-20241022',
 };
 
 export class AutoMemoryMiddleware {
   private config: AutoMemoryConfig;
+  private readonly brainTimeoutMs: number;
   private anthropic: Anthropic | null = null;
   private readonly sessionEntries = new Map<string, number>();
   // Reserve session capacity before the first await so concurrent interactions
@@ -54,11 +66,10 @@ export class AutoMemoryMiddleware {
   private purgeTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(config: Partial<AutoMemoryConfig> = {}, dedup?: DedupStore) {
-    this.config = { ...DEFAULT_CONFIG, ...config };
-    this.config.analysisTimeoutMs = finitePositiveTimeout(
-      this.config.analysisTimeoutMs,
-      DEFAULT_CONFIG.analysisTimeoutMs
-    );
+    const candidate = { ...DEFAULT_CONFIG, ...config };
+    this.brainTimeoutMs = parsePositiveSafeIntegerEnv('BRAIN_TIMEOUT_MS', DEFAULT_BRAIN_TIMEOUT_MS);
+    validateTimeConfig(candidate, this.brainTimeoutMs);
+    this.config = candidate;
     this.dedup = dedup ?? createDedupStore();
 
     this.purgeTimer = setInterval(() => {
@@ -108,18 +119,19 @@ export class AutoMemoryMiddleware {
     const hash = contentHash(request + '\n---\n' + response);
     let reservationToken: string | null = null;
     let persisted = false;
-    // Once the save request may have reached the brain its outcome is unknown:
-    // the pending claim is then kept until its lease expires instead of released.
+    // Once dispatch may begin, the claim is durably quarantined as UNKNOWN and
+    // is never released or expired automatically.
     let keepClaim = false;
 
     try {
       reservationToken = this.dedup.claim(hash, this.effectiveLeaseMinutes());
       if (reservationToken === null) {
-        // Only a committed entry is a final "duplicate"; a pending one belongs to
-        // an interaction that may still fail, so the caller is told it can retry.
-        return this.dedup.status(hash) === 'committed'
-          ? { saved: false, reason: 'duplicate' }
-          : { saved: false, reason: 'duplicate_in_flight', retryable: true };
+        const state = this.dedup.status(hash);
+        if (state === 'committed') return { saved: false, reason: 'duplicate' };
+        if (state === 'unknown') {
+          return { saved: false, reason: 'outcome_unknown', retryable: false };
+        }
+        return { saved: false, reason: 'duplicate_in_flight', retryable: true };
       }
 
       let analysis: AnalysisResult;
@@ -142,10 +154,13 @@ export class AutoMemoryMiddleware {
       }
 
       const brain = getBrainClient();
-      keepClaim = true; // from here on the brain may have stored the entry
-      // The checked-in backend contract does not guarantee that any HTTP error
-      // response proves the write was not committed. Once fetch is invoked,
-      // every failure is therefore treated as ambiguous and the claim is kept.
+      // Establish durable quarantine before invoking the external side effect.
+      // If ownership was lost or the transition cannot be confirmed, fail closed:
+      // no Brain request is dispatched.
+      if (!this.dedup.markUnknown(hash, reservationToken)) {
+        return { saved: false, reason: 'claim_lost', retryable: false };
+      }
+      keepClaim = true;
       await brain.save({
         type: analysis.type,
         content: analysis.summary,
@@ -165,14 +180,21 @@ export class AutoMemoryMiddleware {
       const currentCount = this.sessionEntries.get(sessionKey) || 0;
       this.sessionEntries.set(sessionKey, currentCount + 1);
       try {
-        this.dedup.commit(hash, reservationToken, this.config.deduplicationWindowMinutes);
-      } catch (err) {
-        this.logDedupError('commit', err);
-        try {
-          this.dedup.add(hash, this.config.deduplicationWindowMinutes, reservationToken);
-        } catch (err2) {
-          this.logDedupError('add', err2); // claim then expires with its lease
+        const committed = this.dedup.commit(
+          hash,
+          reservationToken,
+          this.config.deduplicationWindowMinutes
+        );
+        if (!committed) {
+          this.logDedupError(
+            'commit',
+            new Error('Confirmed Brain save could not commit the matching UNKNOWN owner row')
+          );
         }
+      } catch (err) {
+        // Keep UNKNOWN if local durable finalization fails. Never use an
+        // owner-blind UPSERT to overwrite another claim or erase quarantine.
+        this.logDedupError('commit', err);
       }
       return { saved: true, entry: analysis };
     } finally {
@@ -196,10 +218,11 @@ export class AutoMemoryMiddleware {
    * otherwise a claim could expire mid-flight and let a second interaction duplicate it.
    */
   private effectiveLeaseMinutes(): number {
-    const brainTimeoutMs = finitePositiveTimeout(Number(process.env.BRAIN_TIMEOUT_MS), 30_000);
-    const analysisMs = finitePositiveTimeout(this.config.analysisTimeoutMs, DEFAULT_CONFIG.analysisTimeoutMs);
-    const configuredLeaseMs = finitePositiveTimeout(this.config.claimLeaseMinutes, 2) * 60_000;
-    return Math.max(configuredLeaseMs, analysisMs + brainTimeoutMs + 1_000) / 60_000;
+    return deriveEffectiveLeaseMs(
+      this.config.claimLeaseMinutes,
+      this.config.analysisTimeoutMs,
+      this.brainTimeoutMs
+    ) / 60_000;
   }
 
   private logDedupError(op: string, err: unknown): void {
@@ -274,20 +297,17 @@ export class AutoMemoryMiddleware {
   }
 
   updateConfig(config: Partial<AutoMemoryConfig>): void {
+    const candidate = { ...this.config, ...config };
     if (config.minConfidence !== undefined) {
-      config.minConfidence = Math.min(1, Math.max(0, Number(config.minConfidence)));
+      candidate.minConfidence = Math.min(1, Math.max(0, Number(config.minConfidence)));
     }
     if (config.maxEntriesPerSession !== undefined) {
-      config.maxEntriesPerSession = Math.max(1, Math.floor(Number(config.maxEntriesPerSession)));
+      candidate.maxEntriesPerSession = Math.max(1, Math.floor(Number(config.maxEntriesPerSession)));
     }
-    const normalized = { ...config };
-    if (normalized.analysisTimeoutMs !== undefined) {
-      normalized.analysisTimeoutMs = finitePositiveTimeout(
-        normalized.analysisTimeoutMs,
-        DEFAULT_CONFIG.analysisTimeoutMs
-      );
-    }
-    this.config = { ...this.config, ...normalized };
+    // Validate the complete candidate before replacing live configuration.
+    // A rejected update leaves both the current config and caller object intact.
+    validateTimeConfig(candidate, this.brainTimeoutMs);
+    this.config = candidate;
   }
 
   getStatus(): {
@@ -295,12 +315,20 @@ export class AutoMemoryMiddleware {
     sessionCounts: Record<string, number>;
     dedupSize: number;
     dedupBackend: 'sqlite' | 'memory';
+    unknownClaims: { count: number; oldestAt: number | null };
+    effectiveLeaseMs: number;
   } {
     return {
       config: { ...this.config },
       sessionCounts: Object.fromEntries(this.sessionEntries),
       dedupSize: this.dedup.size(),
       dedupBackend: this.dedup.backend,
+      unknownClaims: this.dedup.unknownStats(),
+      effectiveLeaseMs: deriveEffectiveLeaseMs(
+        this.config.claimLeaseMinutes,
+        this.config.analysisTimeoutMs,
+        this.brainTimeoutMs
+      ),
     };
   }
 
