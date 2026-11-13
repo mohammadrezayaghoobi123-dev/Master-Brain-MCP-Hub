@@ -414,11 +414,12 @@ describe('AutoMemoryMiddleware concurrent session limits', () => {
 
 
 describe('AutoMemoryMiddleware durable-save recovery', () => {
-  it('promotes its own claim through owner-aware recovery when commit throws after a durable save', async () => {
+  it('retains UNKNOWN when local commit fails after a confirmed durable save', async () => {
     const dedup = memoryDedup();
     const commit = vi.spyOn(dedup, 'commit').mockImplementation(() => {
       throw new Error('temporary dedup store failure');
     });
+    const add = vi.spyOn(dedup, 'add');
     vi.spyOn(console, 'error').mockImplementation(() => {});
     const mw = new AutoMemoryMiddleware(
       { enabled: true, minConfidence: 0.7, maxEntriesPerSession: 2 },
@@ -452,13 +453,15 @@ describe('AutoMemoryMiddleware durable-save recovery', () => {
         session_id: 'durable-save-session',
       })).resolves.toMatchObject({ saved: true });
 
+      const hash = contentHash('durable request\n---\ndurable response');
       expect(commit).toHaveBeenCalledTimes(1);
-      expect(dedup.status(contentHash('durable request\n---\ndurable response'))).toBe('committed');
+      expect(add).not.toHaveBeenCalled();
+      expect(dedup.status(hash)).toBe('unknown');
       expect(mw.getStatus().sessionCounts['durable-save-session']).toBe(1);
       await expect(mw.processInteraction('durable request', 'durable response', {
         tool: 'manual',
         session_id: 'durable-save-session',
-      })).resolves.toMatchObject({ saved: false, reason: 'duplicate' });
+      })).resolves.toMatchObject({ saved: false, reason: 'outcome_unknown', retryable: false });
       expect(global.fetch).toHaveBeenCalledTimes(1);
     } finally {
       mw.close();
