@@ -598,15 +598,31 @@ describe('SQLite constructor cleanup', () => {
 });
 
 describe('lease configuration validation', () => {
-  it('uses finite positive defaults when lease or timeout configuration is invalid', () => {
-    const mw = makeMw(createMemoryDedupStore(), {
-      claimLeaseMinutes: Number.NaN,
-      analysisTimeoutMs: Number.POSITIVE_INFINITY,
-    });
+  it.each([
+    { claimLeaseMinutes: Number.NaN },
+    { claimLeaseMinutes: Number.POSITIVE_INFINITY },
+    { claimLeaseMinutes: 0 },
+    { claimLeaseMinutes: -1 },
+    { claimLeaseMinutes: 1440.001 },
+    { analysisTimeoutMs: Number.NaN },
+    { analysisTimeoutMs: Number.POSITIVE_INFINITY },
+    { analysisTimeoutMs: 0 },
+    { analysisTimeoutMs: -1 },
+    { analysisTimeoutMs: 1.5 },
+  ])('rejects invalid time configuration %#', (invalidConfig) => {
+    expect(
+      () => new AutoMemoryMiddleware({ enabled: true, ...invalidConfig } as any, createMemoryDedupStore())
+    ).toThrow(RangeError);
+  });
+
+  it('keeps the prior valid configuration when updateConfig rejects an invalid timeout', () => {
+    const mw = makeMw(createMemoryDedupStore());
+    const before = mw.getStatus().config;
+    const supplied = { analysisTimeoutMs: Number.POSITIVE_INFINITY };
     try {
-      const lease = (mw as any).effectiveLeaseMinutes();
-      expect(Number.isFinite(lease)).toBe(true);
-      expect(lease).toBeGreaterThan(0);
+      expect(() => mw.updateConfig(supplied)).toThrow(RangeError);
+      expect(mw.getStatus().config).toEqual(before);
+      expect(supplied.analysisTimeoutMs).toBe(Number.POSITIVE_INFINITY);
     } finally {
       mw.close();
     }
@@ -654,51 +670,12 @@ describe('SQLite unavailable (controlled)', () => {
 });
 
 describe('Auto-Memory analysis timeout validation', () => {
-  it.each([Number.NaN, Number.POSITIVE_INFINITY, 0, -1])(
-    'passes a finite positive timeout to the Anthropic SDK for invalid config %s',
-    async (analysisTimeoutMs) => {
-      const fetchMock = vi.fn().mockResolvedValue(okResponse());
-      global.fetch = fetchMock as unknown as typeof fetch;
-      const mw = makeMw(createMemoryDedupStore(), { analysisTimeoutMs });
-      const create = vi.fn().mockResolvedValue({
-        content: [{ type: 'text', text: JSON.stringify(analysis) }],
-      });
-      vi.spyOn(mw as any, 'analyzeImportance').mockRestore();
-      vi.spyOn(mw as any, 'getAnthropic').mockReturnValue({ messages: { create } });
-
-      try {
-        await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({ saved: true });
-        expect(create).toHaveBeenCalledWith(
-          expect.any(Object),
-          expect.objectContaining({ timeout: 60_000, maxRetries: 0 })
-        );
-        expect(fetchMock).toHaveBeenCalledTimes(1);
-      } finally {
-        mw.close();
-      }
+  it.each([Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1])(
+    'rejects invalid analysis timeout %s',
+    (analysisTimeoutMs) => {
+      expect(() => new AutoMemoryMiddleware({ enabled: true, analysisTimeoutMs })).toThrow(RangeError);
     }
   );
-
-  it('normalizes an invalid timeout supplied through updateConfig before the next analysis', async () => {
-    global.fetch = vi.fn().mockResolvedValue(okResponse()) as unknown as typeof fetch;
-    const mw = makeMw(createMemoryDedupStore());
-    const create = vi.fn().mockResolvedValue({
-      content: [{ type: 'text', text: JSON.stringify(analysis) }],
-    });
-    vi.spyOn(mw as any, 'analyzeImportance').mockRestore();
-    vi.spyOn(mw as any, 'getAnthropic').mockReturnValue({ messages: { create } });
-    mw.updateConfig({ analysisTimeoutMs: Number.POSITIVE_INFINITY });
-
-    try {
-      await mw.processInteraction('req', 'res', SRC);
-      expect(create).toHaveBeenCalledWith(
-        expect.any(Object),
-        expect.objectContaining({ timeout: 60_000, maxRetries: 0 })
-      );
-    } finally {
-      mw.close();
-    }
-  });
 });
 
 describe('lease validation at the store boundary', () => {
