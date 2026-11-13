@@ -474,7 +474,7 @@ describe('SQLite multi-process atomicity', () => {
       }
     `;
 
-        const startChild = () => {
+    const startChild = () => {
       const child = spawn(
         process.execPath,
         ['--import', 'tsx', '--input-type=module', '-e', childScript, dbPath],
