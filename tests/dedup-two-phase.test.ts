@@ -118,6 +118,24 @@ describe.each([
     expect(store.status('h')).toBe('committed');
   });
 
+  it('reports unknown quarantine count and oldest timestamp', () => {
+    const first = store.claim('unknown-1', 5)!;
+    expect(store.markUnknown('unknown-1', first)).toBe(true);
+    advance(MIN);
+    const second = store.claim('unknown-2', 5)!;
+    expect(store.markUnknown('unknown-2', second)).toBe(true);
+    expect(store.unknownStats()).toEqual({ count: 2, oldestAt: T0 });
+    expect(store.commit('unknown-1', first, 30)).toBe(true);
+    expect(store.unknownStats()).toEqual({ count: 1, oldestAt: T0 + MIN });
+  });
+
+  it('rejects invalid commit and add TTL values without changing current state', () => {
+    const owner = store.claim('ttl', 5)!;
+    expect(() => store.commit('ttl', owner, Number.NaN)).toThrow(RangeError);
+    expect(() => store.add('other', 0)).toThrow(RangeError);
+    expect(store.status('ttl')).toBe('pending');
+  });
+
   it('a pending claim expires with its lease (crash before dispatch) and can be re-claimed', () => {
     store.claim('h', 1);
     advance(MIN + 1);
