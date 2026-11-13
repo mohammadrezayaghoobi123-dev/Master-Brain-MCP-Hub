@@ -108,18 +108,19 @@ export class AutoMemoryMiddleware {
     const hash = contentHash(request + '\n---\n' + response);
     let reservationToken: string | null = null;
     let persisted = false;
-    // Once the save request may have reached the brain its outcome is unknown:
-    // the pending claim is then kept until its lease expires instead of released.
+    // Once dispatch may begin, the claim is durably quarantined as UNKNOWN and
+    // is never released or expired automatically.
     let keepClaim = false;
 
     try {
       reservationToken = this.dedup.claim(hash, this.effectiveLeaseMinutes());
       if (reservationToken === null) {
-        // Only a committed entry is a final "duplicate"; a pending one belongs to
-        // an interaction that may still fail, so the caller is told it can retry.
-        return this.dedup.status(hash) === 'committed'
-          ? { saved: false, reason: 'duplicate' }
-          : { saved: false, reason: 'duplicate_in_flight', retryable: true };
+        const state = this.dedup.status(hash);
+        if (state === 'committed') return { saved: false, reason: 'duplicate' };
+        if (state === 'unknown') {
+          return { saved: false, reason: 'outcome_unknown', retryable: false };
+        }
+        return { saved: false, reason: 'duplicate_in_flight', retryable: true };
       }
 
       let analysis: AnalysisResult;
@@ -142,10 +143,13 @@ export class AutoMemoryMiddleware {
       }
 
       const brain = getBrainClient();
-      keepClaim = true; // from here on the brain may have stored the entry
-      // The checked-in backend contract does not guarantee that any HTTP error
-      // response proves the write was not committed. Once fetch is invoked,
-      // every failure is therefore treated as ambiguous and the claim is kept.
+      // Establish durable quarantine before invoking the external side effect.
+      // If ownership was lost or the transition cannot be confirmed, fail closed:
+      // no Brain request is dispatched.
+      if (!this.dedup.markUnknown(hash, reservationToken)) {
+        return { saved: false, reason: 'claim_lost', retryable: false };
+      }
+      keepClaim = true;
       await brain.save({
         type: analysis.type,
         content: analysis.summary,
@@ -165,14 +169,21 @@ export class AutoMemoryMiddleware {
       const currentCount = this.sessionEntries.get(sessionKey) || 0;
       this.sessionEntries.set(sessionKey, currentCount + 1);
       try {
-        this.dedup.commit(hash, reservationToken, this.config.deduplicationWindowMinutes);
-      } catch (err) {
-        this.logDedupError('commit', err);
-        try {
-          this.dedup.add(hash, this.config.deduplicationWindowMinutes, reservationToken);
-        } catch (err2) {
-          this.logDedupError('add', err2); // claim then expires with its lease
+        const committed = this.dedup.commit(
+          hash,
+          reservationToken,
+          this.config.deduplicationWindowMinutes
+        );
+        if (!committed) {
+          this.logDedupError(
+            'commit',
+            new Error('Confirmed Brain save could not commit the matching UNKNOWN owner row')
+          );
         }
+      } catch (err) {
+        // Keep UNKNOWN if local durable finalization fails. Never use an
+        // owner-blind UPSERT to overwrite another claim or erase quarantine.
+        this.logDedupError('commit', err);
       }
       return { saved: true, entry: analysis };
     } finally {
