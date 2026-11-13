@@ -35,6 +35,8 @@ export interface DedupStore {
   release(hash: string, token: string): void;
   /** Record a committed entry only if free (no token) or still owned by the supplied token. */
   add(hash: string, ttlMinutes: number, token?: string): void;
+  /** Safe operational summary of quarantined UNKNOWN rows; never exposes hashes or owner tokens. */
+  unknownStats(): { count: number; oldestAt: number | null };
   purgeExpired(): number;
   size(): number;
   close(): void;
@@ -44,6 +46,7 @@ interface MemoryEntry {
   exp: number;
   state: DedupState;
   owner: string | null;
+  unknownSince: number | null;
 }
 
 class MemoryDedupStore implements DedupStore {
@@ -72,7 +75,7 @@ class MemoryDedupStore implements DedupStore {
     assertValidLease(leaseMinutes);
     if (this.live(hash)) return null;
     const owner = randomUUID();
-    this.entries.set(hash, { exp: Date.now() + leaseMinutes * 60_000, state: 'pending', owner });
+    this.entries.set(hash, { exp: Date.now() + leaseMinutes * 60_000, state: 'pending', owner, unknownSince: null });
     return owner;
   }
 
@@ -81,6 +84,7 @@ class MemoryDedupStore implements DedupStore {
     if (!e || e.state !== 'pending' || e.owner !== token) return false;
     e.state = 'unknown';
     e.exp = Number.POSITIVE_INFINITY;
+    e.unknownSince = Date.now();
     return true;
   }
 
@@ -94,6 +98,7 @@ class MemoryDedupStore implements DedupStore {
       exp: Date.now() + ttlMinutes * 60_000,
       state: 'committed',
       owner: null,
+      unknownSince: null,
     });
     return true;
   }
@@ -113,7 +118,25 @@ class MemoryDedupStore implements DedupStore {
     } else if (current) {
       return;
     }
-    this.entries.set(hash, { exp: Date.now() + ttlMinutes * 60_000, state: 'committed', owner: null });
+    this.entries.set(hash, {
+      exp: Date.now() + ttlMinutes * 60_000,
+      state: 'committed',
+      owner: null,
+      unknownSince: null,
+    });
+  }
+
+  unknownStats(): { count: number; oldestAt: number | null } {
+    let count = 0;
+    let oldestAt: number | null = null;
+    for (const entry of this.entries.values()) {
+      if (entry.state !== 'unknown') continue;
+      count += 1;
+      if (entry.unknownSince !== null && (oldestAt === null || entry.unknownSince < oldestAt)) {
+        oldestAt = entry.unknownSince;
+      }
+    }
+    return { count, oldestAt };
   }
 
   purgeExpired(): number {
@@ -169,6 +192,7 @@ class SqliteDedupStore implements DedupStore {
       for (const ddl of [
         "ALTER TABLE content_hashes ADD COLUMN state TEXT NOT NULL DEFAULT 'committed'",
         'ALTER TABLE content_hashes ADD COLUMN owner TEXT',
+        'ALTER TABLE content_hashes ADD COLUMN unknown_since INTEGER',
       ]) {
         try {
           this.db.exec(ddl);
@@ -215,10 +239,10 @@ class SqliteDedupStore implements DedupStore {
   markUnknown(hash: string, token: string): boolean {
     const result = this.db
       .prepare(
-        `UPDATE content_hashes SET state = 'unknown', expires_at = ?
+        `UPDATE content_hashes SET state = 'unknown', expires_at = ?, unknown_since = ?
          WHERE hash = ? AND state = 'pending' AND owner = ? AND expires_at >= ?`
       )
-      .run(Number.MAX_SAFE_INTEGER, hash, token, Date.now());
+      .run(Number.MAX_SAFE_INTEGER, Date.now(), hash, token, Date.now());
     return result.changes === 1;
   }
 
@@ -228,7 +252,7 @@ class SqliteDedupStore implements DedupStore {
     const expiresAt = now + ttlMinutes * 60_000;
     const result = this.db
       .prepare(
-        `UPDATE content_hashes SET state = 'committed', owner = NULL, expires_at = ?
+        `UPDATE content_hashes SET state = 'committed', owner = NULL, expires_at = ?, unknown_since = NULL
          WHERE hash = ? AND owner = ?
            AND (state = 'unknown' OR (state = 'pending' AND expires_at >= ?))`
       )
@@ -257,10 +281,17 @@ class SqliteDedupStore implements DedupStore {
 
     this.db
       .prepare(
-        `UPDATE content_hashes SET state = 'committed', owner = NULL, expires_at = ?
+        `UPDATE content_hashes SET state = 'committed', owner = NULL, expires_at = ?, unknown_since = NULL
          WHERE hash = ? AND owner = ? AND state IN ('pending', 'unknown')`
       )
       .run(expiresAt, hash, token);
+  }
+
+  unknownStats(): { count: number; oldestAt: number | null } {
+    const row = this.db
+      .prepare("SELECT COUNT(*) AS count, MIN(unknown_since) AS oldestAt FROM content_hashes WHERE state = 'unknown'")
+      .get() as { count: number; oldestAt: number | null };
+    return { count: row.count, oldestAt: row.oldestAt ?? null };
   }
 
   purgeExpired(): number {
