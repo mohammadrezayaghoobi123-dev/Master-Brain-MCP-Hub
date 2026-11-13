@@ -136,6 +136,13 @@ describe.each([
     expect(store.status('ttl')).toBe('pending');
   });
 
+  it('cannot use add() to resolve an UNKNOWN quarantine, even with its owner token', () => {
+    const owner = store.claim('unknown-add', 5)!;
+    expect(store.markUnknown('unknown-add', owner)).toBe(true);
+    store.add('unknown-add', 30, owner);
+    expect(store.status('unknown-add')).toBe('unknown');
+  });
+
   it('a pending claim expires with its lease (crash before dispatch) and can be re-claimed', () => {
     store.claim('h', 1);
     advance(MIN + 1);
@@ -770,8 +777,8 @@ describe('lease validation at the store boundary', () => {
     ['sqlite', () => createDedupStore(dbPath)],
   ])('rejects a non-finite or non-positive lease instead of silently no-oping (%s)', (_name, make) => {
     const store = make();
-    for (const bad of [Number.NaN, Infinity, 0, -1]) {
-      expect(() => store.claim('bad-lease', bad)).toThrow('lease must be');
+    for (const bad of [Number.NaN, Infinity, 0, -1, 0.000001, 1440.001, Number.MAX_VALUE]) {
+      expect(() => store.claim('bad-lease', bad)).toThrow(RangeError);
     }
     expect(store.status('bad-lease')).toBeNull();
     store.close();
