@@ -91,7 +91,27 @@ describe.each([
     expect(store.has('h')).toBe(true);
   });
 
-  it('a pending claim expires with its lease (crash recovery) and can be re-claimed', () => {
+  it('an unknown outcome never expires, is never purged, and blocks a new claim', () => {
+    const owner = store.claim('h', 1)!;
+    expect(store.markUnknown('h', owner)).toBe(true);
+    advance(25 * 60 * MIN);
+    expect(store.purgeExpired()).toBe(0);
+    expect(store.status('h')).toBe('unknown');
+    expect(store.claim('h', 1)).toBeNull();
+    store.release('h', owner);
+    expect(store.status('h')).toBe('unknown');
+  });
+
+  it('only the current owner can transition pending to unknown', () => {
+    const owner = store.claim('h', 1)!;
+    expect(store.markUnknown('h', 'not-the-owner')).toBe(false);
+    expect(store.status('h')).toBe('pending');
+    expect(store.markUnknown('h', owner)).toBe(true);
+    expect(store.markUnknown('h', owner)).toBe(false);
+    expect(store.status('h')).toBe('unknown');
+  });
+
+  it('a pending claim expires with its lease (crash before dispatch) and can be re-claimed', () => {
     store.claim('h', 1);
     advance(MIN + 1);
     expect(store.status('h')).toBeNull();
@@ -108,23 +128,22 @@ describe.each([
     expect(store.status('h')).toBeNull();
   });
 
-  it('a confirmed stale save supersedes a successor lease and remains committed if that successor releases', () => {
+  it('a stale confirmed save cannot overwrite a successor claim', () => {
     const stale = store.claim('h', 1)!;
     advance(MIN + 1);
     const successor = store.claim('h', 5)!;
-    expect(store.commit('h', stale, 30)).toBe(false); // caller lost lease ownership
-    expect(store.status('h')).toBe('committed'); // but the backend save was confirmed
-    store.release('h', successor); // successor failed before saving
-    expect(store.status('h')).toBe('committed');
-    expect(store.claim('h', 1)).toBeNull();
+    expect(store.commit('h', stale, 30)).toBe(false);
+    expect(store.status('h')).toBe('pending');
+    store.release('h', successor);
+    expect(store.status('h')).toBeNull();
   });
 
-  it('records a stale durable save after lease expiry when no successor owns the key', () => {
+  it('does not resurrect an expired claim from a stale owner commit', () => {
     const stale = store.claim('expired-h', 1)!;
     advance(MIN + 1);
     store.purgeExpired();
     expect(store.commit('expired-h', stale, 30)).toBe(false);
-    expect(store.status('expired-h')).toBe('committed');
+    expect(store.status('expired-h')).toBeNull();
   });
 
   it('release only removes the caller\'s own pending claim', () => {
@@ -156,14 +175,14 @@ describe.each([
     expect(store.status('h')).toBe('committed');
   });
 
-  it('owner-aware post-save recovery records committed even after a successor lease starts', () => {
+  it('owner-aware recovery cannot overwrite a successor lease', () => {
     const stale = store.claim('h', 1)!;
     advance(MIN + 1);
     const successor = store.claim('h', 5)!;
     store.add('h', 30, stale);
-    expect(store.status('h')).toBe('committed');
+    expect(store.status('h')).toBe('pending');
     store.release('h', successor);
-    expect(store.status('h')).toBe('committed');
+    expect(store.status('h')).toBeNull();
   });
 
   it('add cannot overwrite a live pending reservation', () => {
@@ -176,14 +195,18 @@ describe.each([
 });
 
 describe('SQLite two-phase persistence', () => {
-  it('pending and committed entries survive a restart (reopen)', () => {
+  it('pending, unknown, and committed entries survive a restart (reopen)', () => {
     const a = createDedupStore(dbPath);
     a.claim('pending-hash', 5);
+    const unknownOwner = a.claim('unknown-hash', 5)!;
+    expect(a.markUnknown('unknown-hash', unknownOwner)).toBe(true);
     a.commit('committed-hash', a.claim('committed-hash', 5)!, 30);
     a.close();
 
     const b = createDedupStore(dbPath);
     expect(b.status('pending-hash')).toBe('pending');
+    expect(b.status('unknown-hash')).toBe('unknown');
+    expect(b.claim('unknown-hash', 5)).toBeNull();
     expect(b.status('committed-hash')).toBe('committed');
     b.close();
   });
@@ -244,36 +267,29 @@ describe('crash between claim and save (shared SQLite file)', () => {
 });
 
 describe('ambiguous save outcome (response loss)', () => {
-  it('keeps the claim after a timeout and retries only after the lease', async () => {
+  it('keeps an ambiguous timeout quarantined beyond the original lease', async () => {
     const fetchMock = vi
       .fn()
       .mockRejectedValueOnce(Object.assign(new Error('aborted'), { name: 'AbortError' }))
       .mockResolvedValue(okResponse());
+    const store = createMemoryDedupStore();
     global.fetch = fetchMock as unknown as typeof fetch;
-    const mw = makeMw(createMemoryDedupStore());
+    const mw = makeMw(store);
 
     await expect(mw.processInteraction('req', 'res', SRC)).rejects.toMatchObject({ code: 'TIMEOUT' });
+    expect(store.status(HASH)).toBe('unknown');
 
-    // the brain may already have stored it: an immediate retry must not create a second entry
+    advance(25 * 60 * MIN);
     await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({
       saved: false,
-      reason: 'duplicate_in_flight',
-      retryable: true,
+      reason: 'outcome_unknown',
+      retryable: false,
     });
     expect(fetchMock).toHaveBeenCalledTimes(1);
-
-    advance(3 * MIN);
-    await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({ saved: true });
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-
     mw.close();
   });
 
-  it('documents the unresolved duplicate-write risk after a save commits but its response is lost', async () => {
-    // Simulate a backend that commits the first POST, then the network drops
-    // the response. The Hub cannot distinguish this from a request that never
-    // reached the backend. After the pending lease expires it retries; without
-    // a server-side idempotency key, the backend can persist the same entry twice.
+  it('does not retry a possibly committed write after its response is lost', async () => {
     const backendWrites: string[] = [];
     const fetchMock = vi.fn()
       .mockImplementationOnce(async (_url: string, init: RequestInit) => {
@@ -284,22 +300,21 @@ describe('ambiguous save outcome (response loss)', () => {
         backendWrites.push(String(init.body));
         return okResponse();
       });
+    const store = createMemoryDedupStore();
     global.fetch = fetchMock as unknown as typeof fetch;
-    const mw = makeMw(createMemoryDedupStore());
+    const mw = makeMw(store);
 
     await expect(mw.processInteraction('req', 'res', SRC)).rejects.toBeDefined();
+    expect(store.status(HASH)).toBe('unknown');
+
+    advance(25 * 60 * MIN);
     await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({
       saved: false,
-      reason: 'duplicate_in_flight',
-      retryable: true,
+      reason: 'outcome_unknown',
+      retryable: false,
     });
     expect(backendWrites).toHaveLength(1);
-
-    advance(3 * MIN);
-    await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({ saved: true });
-    expect(backendWrites).toHaveLength(2);
-    expect(backendWrites[0]).toBe(backendWrites[1]);
-
+    expect(fetchMock).toHaveBeenCalledTimes(1);
     mw.close();
   });
 
@@ -316,7 +331,8 @@ describe('ambiguous save outcome (response loss)', () => {
 
     await expect(mw.processInteraction('req', 'res', SRC)).rejects.toBeDefined();
     await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({
-      reason: 'duplicate_in_flight',
+      reason: 'outcome_unknown',
+      retryable: false,
     });
     expect(fetchMock).toHaveBeenCalledTimes(1);
     mw.close();
@@ -333,7 +349,8 @@ describe('ambiguous save outcome (response loss)', () => {
 
     await expect(mw.processInteraction('req', 'res', SRC)).rejects.toBeDefined();
     await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({
-      reason: 'duplicate_in_flight',
+      reason: 'outcome_unknown',
+      retryable: false,
     });
     expect(fetchMock).toHaveBeenCalledTimes(1);
     mw.close();
@@ -352,8 +369,8 @@ describe('ambiguous save outcome (response loss)', () => {
     await expect(mw.processInteraction('req', 'res', SRC)).rejects.toBeDefined();
     await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({
       saved: false,
-      reason: 'duplicate_in_flight',
-      retryable: true,
+      reason: 'outcome_unknown',
+      retryable: false,
     });
     expect(fetchMock).toHaveBeenCalledTimes(1);
     mw.close();
@@ -361,7 +378,7 @@ describe('ambiguous save outcome (response loss)', () => {
 });
 
 describe('concurrent identical interactions where the first save response is an HTTP error', () => {
-  it('tells the loser it may retry; this client-side test does not prove backend exactly-once', async () => {
+  it('keeps the first dispatched request quarantined after an ambiguous HTTP error', async () => {
     let releaseAnalysis!: () => void;
     const gate = new Promise<void>((r) => (releaseAnalysis = r));
     const fetchMock = vi
@@ -388,13 +405,17 @@ describe('concurrent identical interactions where the first save response is an 
 
     await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({
       saved: false,
-      reason: 'duplicate_in_flight',
-      retryable: true,
+      reason: 'outcome_unknown',
+      retryable: false,
     });
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    advance(3 * MIN);
-    await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({ saved: true });
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    advance(25 * 60 * MIN);
+    await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({
+      saved: false,
+      reason: 'outcome_unknown',
+      retryable: false,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
     mw.close();
   });
 });
