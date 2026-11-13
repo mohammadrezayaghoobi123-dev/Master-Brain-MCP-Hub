@@ -355,3 +355,47 @@ The implementation-planning phase MUST verify, rather than assume:
 - whether current callers depend on silent timeout/TTL normalization.
 
 Any unanswered item MUST remain an explicit implementation blocker or UNVERIFIED dependency, not be filled by assumption.
+
+
+## 16. Repository evidence and implementation boundary (2026-11-13)
+
+The following facts were verified against repository source, not inferred from the design:
+
+### 16.1 Hub evidence
+
+- The current Hub branch uses `DedupState = 'pending' | 'committed'`; it has no durable `unknown` state.
+- `processInteraction` sets `keepClaim = true` before invoking `brain.save`, but the retained row remains `pending` and is removed by ordinary expiry/purge.
+- The current ambiguous-outcome test explicitly demonstrates that a simulated backend write followed by a lost response is retried after lease expiry, producing two backend write attempts. It documents the duplicate-write risk rather than preventing it.
+- The current `commit` path can UPSERT a confirmed stale save over a successor's pending row. That behavior preserves a confirmed write fact but conflates the durable outcome with current claim ownership.
+- `effectiveLeaseMinutes` has no 24-hour effective cap. Timeout normalization currently substitutes defaults for invalid values in selected paths.
+
+### 16.2 Runtime repository evidence and unresolved deployment identity
+
+The accessible repository `Activi-AI/The-Brain` currently exposes `POST /api/memory/store`. Its `src/tools.ts` implementation inserts directly into `memories`; the inspected schema has no idempotency table or unique idempotency constraint, and the inspected handler does not consume `Idempotency-Key`. Its package test script is a placeholder that exits successfully without running tests.
+
+The Hub client currently targets `/api/brain/entries`. The available evidence does not establish that `Activi-AI/The-Brain` is the code deployed behind the Hub's configured `BRAIN_API_URL`, nor that the production endpoint is identical to either repository contract. Therefore:
+- The-Brain is a verified candidate Runtime implementation, not yet proven to be the deployed target.
+- Hub-to-Runtime endpoint compatibility is `UNVERIFIED`.
+- Runtime idempotency is `UNVERIFIED` for the deployed service and `NOT IMPLEMENTED IN THE INSPECTED THE-BRAIN SOURCE`.
+- No end-to-end exactly-once claim is permitted.
+
+The connected GitHub identity has read access but no push permission to `Activi-AI/The-Brain`; no Runtime code has been modified.
+
+### 16.3 Hub safety behavior pending Runtime capability
+
+Until a transactional Runtime idempotency contract and reconciliation path are available, the Hub must prefer safety over automatic retry after a possibly dispatched write:
+- Before dispatch, the owner transitions its durable row from `pending` to `unknown` in a compare-and-set operation.
+- If the transition cannot be durably confirmed, the Hub must not dispatch the write.
+- `unknown` is not expired or purged automatically and blocks a new attempt for the same logical key.
+- A confirmed Runtime success may transition only the same owner-bound `unknown` row to `committed`.
+- A timeout, transport failure, malformed success response, process restart, or ambiguous HTTP error leaves the row `unknown`.
+- An `unknown` row may be resolved only by an explicit reconciliation procedure supported by authoritative Runtime evidence. No automatic clearing or new-key retry is permitted.
+- This fail-closed behavior can reduce availability and may require operator reconciliation. That is an explicit safety trade-off, not an exactly-once guarantee.
+
+This Hub-only containment does not eliminate the need for Runtime idempotency. It prevents the Hub from knowingly reopening the duplicate-write window through lease expiry.
+
+### 16.4 Corrections to the review record
+
+- The existing owner token is a random UUID. The defect is not absence of an owner identifier; it is absence of a durable monotonic fencing generation and the ability of a stale confirmed commit path to overwrite a newer claim.
+- A durable `unknown` state prevents automatic lease-based takeover, but cannot by itself determine whether a write happened. It is a quarantine/reconciliation state, not proof of persistence.
+- A 24-hour maximum lease bounds ownership duration only. It must never be used as an automatic expiry rule for `unknown` outcomes.
