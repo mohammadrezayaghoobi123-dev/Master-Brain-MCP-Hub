@@ -78,6 +78,35 @@ describe('BrainClient — API calls', () => {
     expect(result.id).toBe('123');
   });
 
+  it.each([
+    { ok: true },
+    { id: 'missing-required-fields' },
+    {
+      id: '123',
+      type: 'not-a-memory-type',
+      content: 'Test content',
+      tags: [],
+      timestamp: new Date().toISOString(),
+      source: { tool: 'claude-code' },
+    },
+    {
+      id: '123',
+      type: 'decision',
+      content: 'Test content',
+      tags: [],
+      timestamp: 'not-a-date',
+      source: { tool: 'claude-code' },
+    },
+  ])('rejects malformed 2xx BrainEntry response %#', async (body) => {
+    mockFetch.mockResolvedValueOnce({ ok: true, status: 201, json: async () => body });
+    await expect(client.save({
+      type: 'decision',
+      content: 'Test content',
+      tags: ['test'],
+      source: { tool: 'claude-code' },
+    })).rejects.toMatchObject({ code: 'BRAIN_HTTP_ERROR' });
+  });
+
   it('throws AppError BRAIN_HTTP_ERROR on 500', async () => {
     mockFetch.mockResolvedValueOnce({
       ok: false,
