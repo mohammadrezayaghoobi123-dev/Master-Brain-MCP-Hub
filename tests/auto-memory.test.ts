@@ -292,6 +292,21 @@ describe('AutoMemoryMiddleware reservation recovery', () => {
   });
 });
 
+describe('Auto-Memory UNKNOWN observability', () => {
+  it('exposes unknown claim count and oldest timestamp without exposing owner tokens', () => {
+    const dedup = memoryDedup();
+    const owner = dedup.claim('observability-hash', 5)!;
+    dedup.markUnknown('observability-hash', owner);
+    const mw = new AutoMemoryMiddleware({ enabled: true }, dedup);
+    try {
+      expect(mw.getStatus().unknownClaims).toEqual({ count: 1, oldestAt: Date.now() });
+      expect(JSON.stringify(mw.getStatus())).not.toContain(owner);
+    } finally {
+      mw.close();
+    }
+  });
+});
+
 describe('SQLite dedup reservations', () => {
   it('allows only one reservation across store instances sharing the same database', () => {
     const directory = mkdtempSync(join(tmpdir(), 'master-brain-dedup-'));
