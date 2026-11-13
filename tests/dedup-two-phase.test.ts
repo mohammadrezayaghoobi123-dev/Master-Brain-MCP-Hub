@@ -231,6 +231,7 @@ describe('SQLite two-phase persistence', () => {
     const b = createDedupStore(dbPath);
     expect(b.status('pending-hash')).toBe('pending');
     expect(b.status('unknown-hash')).toBe('unknown');
+    expect(b.unknownStats()).toEqual({ count: 1, oldestAt: T0 });
     expect(b.claim('unknown-hash', 5)).toBeNull();
     expect(b.status('committed-hash')).toBe('committed');
     b.close();
@@ -629,6 +630,11 @@ describe('lease configuration validation', () => {
     { claimLeaseMinutes: 0 },
     { claimLeaseMinutes: -1 },
     { claimLeaseMinutes: 1440.001 },
+    { deduplicationWindowMinutes: Number.NaN },
+    { deduplicationWindowMinutes: Number.POSITIVE_INFINITY },
+    { deduplicationWindowMinutes: 0 },
+    { deduplicationWindowMinutes: -1 },
+    { deduplicationWindowMinutes: 0.000001 },
     { analysisTimeoutMs: Number.NaN },
     { analysisTimeoutMs: Number.POSITIVE_INFINITY },
     { analysisTimeoutMs: 0 },
@@ -640,14 +646,18 @@ describe('lease configuration validation', () => {
     ).toThrow(RangeError);
   });
 
-  it('keeps the prior valid configuration when updateConfig rejects an invalid timeout', () => {
+  it.each([
+    { analysisTimeoutMs: Number.POSITIVE_INFINITY },
+    { deduplicationWindowMinutes: Number.NaN },
+    { claimLeaseMinutes: 1441 },
+  ])('keeps the prior valid configuration when updateConfig rejects %#', (supplied) => {
     const mw = makeMw(createMemoryDedupStore());
     const before = mw.getStatus().config;
-    const supplied = { analysisTimeoutMs: Number.POSITIVE_INFINITY };
+    const original = { ...supplied };
     try {
       expect(() => mw.updateConfig(supplied)).toThrow(RangeError);
       expect(mw.getStatus().config).toEqual(before);
-      expect(supplied.analysisTimeoutMs).toBe(Number.POSITIVE_INFINITY);
+      expect(supplied).toEqual(original);
     } finally {
       mw.close();
     }
@@ -695,7 +705,7 @@ describe('SQLite unavailable (controlled)', () => {
 });
 
 describe('Auto-Memory analysis timeout validation', () => {
-  it.each([Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1])(
+  it.each([Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, 2_147_483_648, Number.MAX_VALUE])(
     'rejects invalid analysis timeout %s',
     (analysisTimeoutMs) => {
       expect(() => new AutoMemoryMiddleware({ enabled: true, analysisTimeoutMs })).toThrow(RangeError);
