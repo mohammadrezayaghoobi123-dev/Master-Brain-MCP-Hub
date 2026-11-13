@@ -43,7 +43,7 @@ function isBrainEntry(value: unknown): value is BrainEntry {
     if (source[key] !== undefined && typeof source[key] !== 'string') return false;
   }
   if (typeof value.timestamp !== 'string') return false;
-  if (!/^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$/.test(value.timestamp)) return false;
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value.timestamp)) return false;
   if (!Number.isFinite(Date.parse(value.timestamp))) return false;
   if (value.summary !== undefined && typeof value.summary !== 'string') return false;
   if (value.metadata !== undefined && !isRecord(value.metadata)) return false;
