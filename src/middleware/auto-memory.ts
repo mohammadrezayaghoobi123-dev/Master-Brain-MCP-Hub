@@ -18,6 +18,14 @@ import { getBrainClient } from '../brain/client.js';
 import { contentHash } from '../lib/hash.js';
 import { createDedupStore, type DedupStore } from '../lib/dedup-store.js';
 import { AppError } from '../lib/errors.js';
+import {
+  DEFAULT_ANALYSIS_TIMEOUT_MS,
+  DEFAULT_BRAIN_TIMEOUT_MS,
+  deriveEffectiveLeaseMs,
+  leaseMinutesToMs,
+  parsePositiveSafeIntegerEnv,
+  assertPositiveSafeIntegerMs,
+} from '../lib/time-budget.js';
 
 const analysisSchema = z.object({
   isImportant: z.boolean(),
@@ -28,8 +36,11 @@ const analysisSchema = z.object({
   context: z.string().max(500).optional(),
 });
 
-function finitePositiveTimeout(value: unknown, fallback: number): number {
-  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback;
+function validateTimeConfig(config: AutoMemoryConfig, brainTimeoutMs: number): void {
+  assertPositiveSafeIntegerMs(config.analysisTimeoutMs, 'analysisTimeoutMs');
+  leaseMinutesToMs(config.claimLeaseMinutes, 'claimLeaseMinutes');
+  leaseMinutesToMs(config.deduplicationWindowMinutes, 'deduplicationWindowMinutes');
+  deriveEffectiveLeaseMs(config.claimLeaseMinutes, config.analysisTimeoutMs, brainTimeoutMs);
 }
 
 const DEFAULT_CONFIG: AutoMemoryConfig = {
@@ -39,12 +50,13 @@ const DEFAULT_CONFIG: AutoMemoryConfig = {
   maxEntriesPerSession: 50,
   deduplicationWindowMinutes: 30,
   claimLeaseMinutes: 2,
-  analysisTimeoutMs: 60_000,
+  analysisTimeoutMs: DEFAULT_ANALYSIS_TIMEOUT_MS,
   analysisModel: process.env.AUTO_MEMORY_MODEL || 'claude-3-5-haiku-20241022',
 };
 
 export class AutoMemoryMiddleware {
   private config: AutoMemoryConfig;
+  private readonly brainTimeoutMs: number;
   private anthropic: Anthropic | null = null;
   private readonly sessionEntries = new Map<string, number>();
   // Reserve session capacity before the first await so concurrent interactions
@@ -54,11 +66,10 @@ export class AutoMemoryMiddleware {
   private purgeTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(config: Partial<AutoMemoryConfig> = {}, dedup?: DedupStore) {
-    this.config = { ...DEFAULT_CONFIG, ...config };
-    this.config.analysisTimeoutMs = finitePositiveTimeout(
-      this.config.analysisTimeoutMs,
-      DEFAULT_CONFIG.analysisTimeoutMs
-    );
+    const candidate = { ...DEFAULT_CONFIG, ...config };
+    this.brainTimeoutMs = parsePositiveSafeIntegerEnv('BRAIN_TIMEOUT_MS', DEFAULT_BRAIN_TIMEOUT_MS);
+    validateTimeConfig(candidate, this.brainTimeoutMs);
+    this.config = candidate;
     this.dedup = dedup ?? createDedupStore();
 
     this.purgeTimer = setInterval(() => {
@@ -207,10 +218,11 @@ export class AutoMemoryMiddleware {
    * otherwise a claim could expire mid-flight and let a second interaction duplicate it.
    */
   private effectiveLeaseMinutes(): number {
-    const brainTimeoutMs = finitePositiveTimeout(Number(process.env.BRAIN_TIMEOUT_MS), 30_000);
-    const analysisMs = finitePositiveTimeout(this.config.analysisTimeoutMs, DEFAULT_CONFIG.analysisTimeoutMs);
-    const configuredLeaseMs = finitePositiveTimeout(this.config.claimLeaseMinutes, 2) * 60_000;
-    return Math.max(configuredLeaseMs, analysisMs + brainTimeoutMs + 1_000) / 60_000;
+    return deriveEffectiveLeaseMs(
+      this.config.claimLeaseMinutes,
+      this.config.analysisTimeoutMs,
+      this.brainTimeoutMs
+    ) / 60_000;
   }
 
   private logDedupError(op: string, err: unknown): void {
@@ -285,20 +297,17 @@ export class AutoMemoryMiddleware {
   }
 
   updateConfig(config: Partial<AutoMemoryConfig>): void {
+    const candidate = { ...this.config, ...config };
     if (config.minConfidence !== undefined) {
-      config.minConfidence = Math.min(1, Math.max(0, Number(config.minConfidence)));
+      candidate.minConfidence = Math.min(1, Math.max(0, Number(config.minConfidence)));
     }
     if (config.maxEntriesPerSession !== undefined) {
-      config.maxEntriesPerSession = Math.max(1, Math.floor(Number(config.maxEntriesPerSession)));
+      candidate.maxEntriesPerSession = Math.max(1, Math.floor(Number(config.maxEntriesPerSession)));
     }
-    const normalized = { ...config };
-    if (normalized.analysisTimeoutMs !== undefined) {
-      normalized.analysisTimeoutMs = finitePositiveTimeout(
-        normalized.analysisTimeoutMs,
-        DEFAULT_CONFIG.analysisTimeoutMs
-      );
-    }
-    this.config = { ...this.config, ...normalized };
+    // Validate the complete candidate before replacing live configuration.
+    // A rejected update leaves both the current config and caller object intact.
+    validateTimeConfig(candidate, this.brainTimeoutMs);
+    this.config = candidate;
   }
 
   getStatus(): {
