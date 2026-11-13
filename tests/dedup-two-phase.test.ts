@@ -132,7 +132,9 @@ describe.each([
   it('rejects invalid commit and add TTL values without changing current state', () => {
     const owner = store.claim('ttl', 5)!;
     expect(() => store.commit('ttl', owner, Number.NaN)).toThrow(RangeError);
+    expect(() => store.commit('ttl', owner, 0.000001)).toThrow(RangeError);
     expect(() => store.add('other', 0)).toThrow(RangeError);
+    expect(() => store.add('other', Number.MAX_VALUE)).toThrow(RangeError);
     expect(store.status('ttl')).toBe('pending');
   });
 
