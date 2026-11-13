@@ -90,13 +90,13 @@ class MemoryDedupStore implements DedupStore {
   }
 
   commit(hash: string, token: string, ttlMinutes: number): boolean {
-    assertValidTtl(ttlMinutes);
+    const expiresAt = expiresAtForTtl(ttlMinutes);
     const e = this.live(hash);
     if (!e || (e.state !== 'pending' && e.state !== 'unknown') || e.owner !== token) {
       return false;
     }
     this.entries.set(hash, {
-      exp: Date.now() + ttlMinutes * 60_000,
+      exp: expiresAt,
       state: 'committed',
       owner: null,
       unknownSince: null,
@@ -110,7 +110,7 @@ class MemoryDedupStore implements DedupStore {
   }
 
   add(hash: string, ttlMinutes: number, token?: string): void {
-    assertValidTtl(ttlMinutes);
+    const expiresAt = expiresAtForTtl(ttlMinutes);
     const current = this.live(hash);
     if (token) {
       if (!current || current.owner !== token || current.state !== 'pending') {
@@ -120,7 +120,7 @@ class MemoryDedupStore implements DedupStore {
       return;
     }
     this.entries.set(hash, {
-      exp: Date.now() + ttlMinutes * 60_000,
+      exp: expiresAt,
       state: 'committed',
       owner: null,
       unknownSince: null,
@@ -252,9 +252,8 @@ class SqliteDedupStore implements DedupStore {
   }
 
   commit(hash: string, token: string, ttlMinutes: number): boolean {
-    assertValidTtl(ttlMinutes);
     const now = Date.now();
-    const expiresAt = now + ttlMinutes * 60_000;
+    const expiresAt = expiresAtForTtl(ttlMinutes, now);
     const result = this.db
       .prepare(
         `UPDATE content_hashes SET state = 'committed', owner = NULL, expires_at = ?, unknown_since = NULL
@@ -272,9 +271,9 @@ class SqliteDedupStore implements DedupStore {
   }
 
   add(hash: string, ttlMinutes: number, token?: string): void {
-    assertValidTtl(ttlMinutes);
+    const now = Date.now();
+    const expiresAt = expiresAtForTtl(ttlMinutes, now);
     this.purgeExpired();
-    const expiresAt = Date.now() + ttlMinutes * 60_000;
     if (!token) {
       this.db
         .prepare(
@@ -326,9 +325,13 @@ function assertValidLease(leaseMinutes: number): void {
   }
 }
 
-/** Deduplication TTLs may exceed the claim cap, but must remain exact safe integer milliseconds. */
-function assertValidTtl(ttlMinutes: number): void {
-  leaseMinutesToMs(ttlMinutes, 'ttlMinutes');
+/** Deduplication TTLs may exceed the claim cap, but the absolute expiry must remain a safe integer. */
+function expiresAtForTtl(ttlMinutes: number, now = Date.now()): number {
+  const expiresAt = now + leaseMinutesToMs(ttlMinutes, 'ttlMinutes');
+  if (!Number.isSafeInteger(expiresAt)) {
+    throw new RangeError('[DedupStore] absolute TTL expiry exceeds the safe integer timestamp range');
+  }
+  return expiresAt;
 }
 
 /** In-process store (tests, or explicit opt-out of persistence). */
