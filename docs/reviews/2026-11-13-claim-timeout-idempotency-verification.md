@@ -3,7 +3,7 @@
 **Verification date:** 2026-11-13  
 **Repository:** `mohammadrezayaghoobi123-dev/Master-Brain-MCP-Hub`  
 **Branch:** `fix/unknown-state-hard-lease-2026-11-13`  
-**Verified head:** `1060033216cdafb1dc49057974f9a5c01146a0f6`  
+**Verified head:** `263538e37a7f10d672c0eaba806f72899cdb136d`  
 **Pull request:** [#9 — claim/timeout/idempotency hardening](https://github.com/mohammadrezayaghoobi123-dev/Master-Brain-MCP-Hub/pull/9)  
 **Base:** `fix/integration-regressions-pr4-2026-11-13` at PR #5 head `fea31f01b6b56e498a0f6a1f1c340c05ea8ca186`
 
@@ -11,7 +11,7 @@
 
 **HUB BRANCH: CI PASS**
 
-The exact verified head was tested by GitHub Actions run [#102 / 43468704750](https://github.com/mohammadrezayaghoobi123-dev/Master-Brain-MCP-Hub/actions/runs/43468704750).
+The exact verified head was tested by GitHub Actions run [#110 / 43469564256](https://github.com/mohammadrezayaghoobi123-dev/Master-Brain-MCP-Hub/actions/runs/43469564256).
 
 | Gate | Result | Evidence |
 |---|---|---|
@@ -20,7 +20,7 @@ The exact verified head was tested by GitHub Actions run [#102 / 43468704750](ht
 | Node.js 26 | PASS | Typecheck, 169 unit tests, build |
 | Dependency audit | PASS | `npm audit --audit-level=moderate` workflow gate |
 | Test files | 6 passed | Vitest summary |
-| Unit tests | 169 passed | Vitest summary |
+| Unit tests | 173 passed | Vitest summary |
 | Merge | NOT PERFORMED | PR remains open |
 | Deployment | NOT PERFORMED | No deployment action taken |
 
@@ -34,8 +34,8 @@ This is CI evidence for the exact SHA above. It is not a production or Runtime e
 - Immediately before external Brain dispatch, the current owner must atomically transition `pending -> unknown`.
 - If that compare-and-set fails or throws, the external write is not dispatched.
 - `unknown` never expires, is not purged, and blocks a new claim.
-- `release` and `add` cannot remove or resolve `unknown`.
-- Only an owner-matching confirmed-save `commit` may transition `unknown -> committed`.
+- `release` and ownerless `add` cannot remove or resolve `unknown`; `add` exposes no owner-token overload.
+- `commit` requires the current owner and the `unknown` state; direct `pending -> committed` is rejected.
 - A stale owner cannot UPSERT over a successor claim.
 - SQLite persists `unknown` and `unknown_since`; the migration is additive/idempotent and the operational query has an index.
 - Operational status exposes only UNKNOWN count and oldest timestamp; hashes and owner tokens are not exposed.
@@ -65,7 +65,8 @@ A 2xx response is treated as confirmed only if it satisfies the documented `Brai
 | UNKNOWN quarantine, no ambiguous retry, strict config | CI run `43466364534` / `c13f2082...` | CI run `43466794549` / `70b97576...` |
 | UNKNOWN metrics and restart persistence | CI run `43467083294` / `dc97702a...` | CI run `43467292406` / `9e96189c...` |
 | BrainEntry response validation | CI run `43467716362` / `0aa6f51c...` | CI run `43467980184` / `ae7f0c62...` |
-| Store-level lease/TTL bounds and UNKNOWN resolution restriction | CI run `43468428759` / `aa8e9765...` | Final CI run `43468704750` / `10600332...` |
+| Store-level lease/TTL bounds and UNKNOWN resolution restriction | CI run `43468428759` / `aa8e9765...` | CI run `43469564256` / `263538e3...` |
+| Explicit state-machine enforcement (UNKNOWN-only commit; ownerless add) | CI run `43469318955` / `86b96b66...` | Final CI run `43469564256` / `263538e3...` |
 
 Red runs failed on the intended new assertions. Green runs passed the relevant tests and full quality matrix. The final run is the acceptance evidence.
 
