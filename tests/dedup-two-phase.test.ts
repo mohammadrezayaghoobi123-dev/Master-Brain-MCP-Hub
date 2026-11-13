@@ -612,6 +612,8 @@ describe('Auto-Memory analysis timeout validation', () => {
     } finally {
       mw.close();
     }
+  });
+});
 
 describe('lease validation at the store boundary', () => {
   it.each([
