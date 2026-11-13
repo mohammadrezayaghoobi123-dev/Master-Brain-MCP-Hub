@@ -43,6 +43,11 @@ function finitePositiveLeaseMinutes(value: unknown, fallback: number): number {
     : fallback;
 }
 
+/** A non-finite or non-positive number of minutes would make the dedup store reject or never expire entries. */
+function finitePositiveMinutes(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
 const DEFAULT_CONFIG: AutoMemoryConfig = {
   enabled: true,
   minConfidence: 0.7,
@@ -69,6 +74,10 @@ export class AutoMemoryMiddleware {
     this.config.analysisTimeoutMs = finitePositiveTimeout(
       this.config.analysisTimeoutMs,
       DEFAULT_CONFIG.analysisTimeoutMs
+    );
+    this.config.deduplicationWindowMinutes = finitePositiveMinutes(
+      this.config.deduplicationWindowMinutes,
+      DEFAULT_CONFIG.deduplicationWindowMinutes
     );
     this.dedup = dedup ?? createDedupStore();
 
@@ -296,6 +305,12 @@ export class AutoMemoryMiddleware {
       normalized.analysisTimeoutMs = finitePositiveTimeout(
         normalized.analysisTimeoutMs,
         DEFAULT_CONFIG.analysisTimeoutMs
+      );
+    }
+    if (normalized.deduplicationWindowMinutes !== undefined) {
+      normalized.deduplicationWindowMinutes = finitePositiveMinutes(
+        normalized.deduplicationWindowMinutes,
+        DEFAULT_CONFIG.deduplicationWindowMinutes
       );
     }
     this.config = { ...this.config, ...normalized };

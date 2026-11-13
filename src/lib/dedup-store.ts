@@ -79,6 +79,7 @@ class MemoryDedupStore implements DedupStore {
   }
 
   commit(hash: string, token: string, ttlMinutes: number): boolean {
+    assertValidMinutes('ttlMinutes', ttlMinutes);
     const e = this.live(hash);
     const owned = e?.state === 'pending' && e.owner === token;
 
@@ -100,6 +101,7 @@ class MemoryDedupStore implements DedupStore {
   }
 
   add(hash: string, ttlMinutes: number, token?: string): void {
+    assertValidMinutes('ttlMinutes', ttlMinutes);
     const current = this.live(hash);
     if (current && !token) return;
 
@@ -207,6 +209,7 @@ class SqliteDedupStore implements DedupStore {
   }
 
   commit(hash: string, token: string, ttlMinutes: number): boolean {
+    assertValidMinutes('ttlMinutes', ttlMinutes);
     const expiresAt = Date.now() + ttlMinutes * 60_000;
     const result = this.db
       .prepare(
@@ -240,6 +243,7 @@ class SqliteDedupStore implements DedupStore {
   }
 
   add(hash: string, ttlMinutes: number, token?: string): void {
+    assertValidMinutes('ttlMinutes', ttlMinutes);
     this.purgeExpired();
     const expiresAt = Date.now() + ttlMinutes * 60_000;
     if (!token) {
@@ -281,6 +285,13 @@ class SqliteDedupStore implements DedupStore {
 
   close(): void {
     this.db.close();
+  }
+}
+
+/** A non-finite or non-positive TTL is bound as NULL by SQLite (NOT NULL violation) or never expires. */
+function assertValidMinutes(name: string, minutes: number): void {
+  if (!Number.isFinite(minutes) || minutes <= 0) {
+    throw new RangeError(`[DedupStore] ${name} must be a positive finite number of minutes, got ${minutes}`);
   }
 }
 

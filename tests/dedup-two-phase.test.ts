@@ -614,3 +614,39 @@ describe('Auto-Memory analysis timeout validation', () => {
     }
   });
 });
+
+describe('deduplication window validation (review finding P5-1)', () => {
+  it.each([Number.NaN, Infinity, 0, -1])(
+    'commits after a successful save even when deduplicationWindowMinutes is %s (constructor)',
+    async (bad) => {
+      global.fetch = vi.fn().mockResolvedValue(okResponse()) as unknown as typeof fetch;
+      const store = createDedupStore(dbPath, { requireSqlite: true });
+      const mw = makeMw(store, { deduplicationWindowMinutes: bad });
+      await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({ saved: true });
+      expect(store.status(HASH)).toBe('committed');
+      mw.close();
+    }
+  );
+
+  it('commits after a successful save when updateConfig supplies an invalid window', async () => {
+    global.fetch = vi.fn().mockResolvedValue(okResponse()) as unknown as typeof fetch;
+    const store = createDedupStore(dbPath, { requireSqlite: true });
+    const mw = makeMw(store);
+    mw.updateConfig({ deduplicationWindowMinutes: Number.NaN });
+    await expect(mw.processInteraction('req', 'res', SRC)).resolves.toMatchObject({ saved: true });
+    expect(store.status(HASH)).toBe('committed');
+    mw.close();
+  });
+
+  it.each([
+    ['memory', () => createMemoryDedupStore()],
+    ['sqlite', () => createDedupStore(dbPath, { requireSqlite: true })],
+  ])('commit() and add() reject an invalid TTL instead of silently failing (%s)', (_name, make) => {
+    const store = make();
+    const token = store.claim('ttl-hash', 1) as string;
+    expect(() => store.commit('ttl-hash', token, Number.NaN)).toThrow('ttlMinutes must be');
+    expect(() => store.add('ttl-hash-2', 0)).toThrow('ttlMinutes must be');
+    expect(store.status('ttl-hash')).toBe('pending');
+    store.close();
+  });
+});
