@@ -43,6 +43,9 @@ function validateTimeConfig(config: AutoMemoryConfig, brainTimeoutMs: number): v
   deriveEffectiveLeaseMs(config.claimLeaseMinutes, config.analysisTimeoutMs, brainTimeoutMs);
 }
 
+const UNKNOWN_ALERT_COUNT_THRESHOLD = 10;
+const UNKNOWN_ALERT_AGE_MS = 60 * 60_000;
+
 const DEFAULT_CONFIG: AutoMemoryConfig = {
   enabled: true,
   minConfidence: 0.7,
@@ -64,6 +67,7 @@ export class AutoMemoryMiddleware {
   private readonly sessionReservations = new Map<string, number>();
   private readonly dedup: DedupStore;
   private purgeTimer: ReturnType<typeof setInterval> | null = null;
+  private lastUnknownAlertKey: string | null = null;
 
   constructor(config: Partial<AutoMemoryConfig> = {}, dedup?: DedupStore) {
     const candidate = { ...DEFAULT_CONFIG, ...config };
@@ -75,8 +79,29 @@ export class AutoMemoryMiddleware {
     this.purgeTimer = setInterval(() => {
       try {
         this.dedup.purgeExpired();
+        const unknown = this.dedup.unknownStats();
+        if (unknown.count === 0) {
+          this.lastUnknownAlertKey = null;
+          return;
+        }
+
+        const oldestAgeMs =
+          unknown.oldestAt === null ? null : Math.max(0, Date.now() - unknown.oldestAt);
+        const alertDue =
+          unknown.count >= UNKNOWN_ALERT_COUNT_THRESHOLD ||
+          oldestAgeMs === null ||
+          oldestAgeMs >= UNKNOWN_ALERT_AGE_MS;
+        if (!alertDue) return;
+
+        const signature = `${unknown.count}:${unknown.oldestAt}`;
+        if (signature === this.lastUnknownAlertKey) return;
+        const oldestAge = oldestAgeMs === null ? 'unknown' : `${Math.floor(oldestAgeMs / 60_000)}m`;
+        console.error(
+          `[AutoMemory] ALERT: ${unknown.count} UNKNOWN write(s) remain quarantined; oldest age ${oldestAge}. Check dedup-admin list and verify backend outcome before resolving.`
+        );
+        this.lastUnknownAlertKey = signature;
       } catch {
-        /* non-fatal */
+        /* non-fatal: monitoring must never change write-safety behavior */
       }
     }, 5 * 60_000);
     if (typeof this.purgeTimer === 'object' && 'unref' in this.purgeTimer) {
@@ -194,6 +219,13 @@ export class AutoMemoryMiddleware {
             // Preserve the original network failure and retain UNKNOWN on local-store failure.
             this.logDedupError('revert-unknown', revertError);
           }
+        }
+        if (keepClaim) {
+          // Operators reconcile quarantined writes by hash prefix (never the full hash or token).
+          console.error(
+            `[AutoMemory] write left in UNKNOWN quarantine (hash ${hash.slice(0, 12)}); ` +
+              'verify against the backend, then resolve with: npm run dedup:admin -- list'
+          );
         }
         throw error;
       }
