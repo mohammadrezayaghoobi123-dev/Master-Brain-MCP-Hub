@@ -1,5 +1,5 @@
-// Real-socket regression tests (no fetch mocks). They pin the exact Undici error shapes
-// on every Node version in the CI matrix and falsify the "pre-dispatch" classification.
+// Real-socket regression tests (no fetch mocks). They exercise Undici transport behavior
+// on every Node version in the CI matrix and falsify the redirect/pre-dispatch classification.
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createServer, type Server } from 'node:http';
 import { createServer as createNetServer } from 'node:net';
