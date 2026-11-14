@@ -363,7 +363,7 @@ export function createDedupStore(explicitPath?: string, options: CreateDedupStor
     configuredPath ||
     join(process.cwd(), '.data', 'auto-memory-dedup.sqlite');
 
-  if (requireSqlite && (!configuredPath || !isAbsolute(configuredPath))) {
+  if (process.env.NODE_ENV === 'production' && (!configuredPath || !isAbsolute(configuredPath))) {
     throw new Error(
       '[DedupStore] production requires an absolute DEDUP_DB_PATH or DATA_DIR; refusing a cwd-dependent SQLite location'
     );
