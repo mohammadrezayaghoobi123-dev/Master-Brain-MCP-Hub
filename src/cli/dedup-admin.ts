@@ -7,10 +7,13 @@
 //   npm run dedup:admin -- list
 //   npm run dedup:admin -- resolve <hash-prefix> --outcome not_stored|stored [--yes]
 //   npm run dedup:admin -- audit [--limit N]
+import { existsSync, realpathSync } from 'node:fs';
 import { userInfo } from 'node:os';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
+import { DEFAULT_BRAIN_TIMEOUT_MS, parsePositiveSafeIntegerEnv } from '../lib/time-budget.js';
 import {
   createDedupStore,
+  locateDedupDb,
   DEFAULT_RESOLVE_TTL_MINUTES,
   type DedupStore,
   type UnknownOutcome,
@@ -36,13 +39,43 @@ export const EXIT_CONFIRM = 3;
 
 const DEFAULT_MIN_AGE_MINUTES = 10;
 
+/**
+ * Oldest an UNKNOWN entry may be before an operator can resolve it: the larger of the fixed floor
+ * and twice the configured Brain timeout (+1s), so a request that is still legitimately in flight
+ * (or about to time out) can never be resolved as 'not stored'. Mirrors the budget the middleware
+ * persists with each entry; this covers rows written before that column existed.
+ */
+export function minResolveAgeMs(): number {
+  const timeoutMs = parsePositiveSafeIntegerEnv('BRAIN_TIMEOUT_MS', DEFAULT_BRAIN_TIMEOUT_MS);
+  return Math.max(DEFAULT_MIN_AGE_MINUTES * 60_000, timeoutMs * 2 + 1000);
+}
+
+/** True when this module is the process entrypoint, also through npm/.bin symlinks. */
+export function isEntrypoint(metaUrl: string, argv1: string | undefined): boolean {
+  if (argv1 === undefined) return false;
+  try {
+    return realpathSync(fileURLToPath(metaUrl)) === realpathSync(argv1);
+  } catch {
+    return false;
+  }
+}
+
 const USAGE = [
   'Usage:',
   '  dedup-admin list',
   '  dedup-admin resolve <hash-prefix> --outcome not_stored|stored [--note TEXT]',
-  `                      [--ttl-minutes N (stored only, default ${DEFAULT_RESOLVE_TTL_MINUTES})] [--yes]`,
+  `                      [--ttl-minutes N (REQUIRED for stored; must equal the Hub's dedup window, e.g. ${DEFAULT_RESOLVE_TTL_MINUTES})] [--yes]`,
   '  dedup-admin audit [--limit N]',
 ].join('\n');
+
+const REFUSAL_TEXT: Record<string, string> = {
+  invalid_prefix: 'The hash prefix must be 8-64 hexadecimal characters.',
+  not_found: 'No UNKNOWN entry matches that prefix (it may already be resolved).',
+  ambiguous: 'More than one UNKNOWN entry matches; use a longer prefix.',
+  too_recent: 'The entry was quarantined too recently; a request may still be in flight.',
+  in_flight: "The request's own timeout budget has not elapsed yet; it may still complete.",
+  missing_timestamp: 'The UNKNOWN entry has no quarantine timestamp; refusing to resolve corrupted or legacy state.',
+};
 
 function parseFlags(args: string[]): { positional: string[]; flags: Map<string, string | true> } {
   const positional: string[] = [];
@@ -91,11 +124,15 @@ export function runCli(argv: string[], options: CliOptions = {}): number {
   const ownsStore = store === undefined;
   try {
     if (!store) {
-      store = createDedupStore();
-      if (store.backend !== 'sqlite') {
-        io.err('No persistent SQLite dedup store is configured; there is nothing to resolve. Set DEDUP_DB_PATH or DATA_DIR.');
+      const location = locateDedupDb();
+      if (!existsSync(location.path)) {
+        io.err(
+          `No dedup database at ${location.path}. Refusing to create one: set DEDUP_DB_PATH (or DATA_DIR) to the Hub's database.`
+        );
         return EXIT_REFUSED;
       }
+      store = createDedupStore(undefined, { requireSqlite: true });
+      io.out(`Dedup database: ${location.path}`);
     }
     const { positional, flags } = parseFlags(rest);
 
@@ -134,6 +171,10 @@ export function runCli(argv: string[], options: CliOptions = {}): number {
       io.err(USAGE);
       return EXIT_USAGE;
     }
+    if (outcome === 'stored' && !flags.has('ttl-minutes')) {
+      io.err("--ttl-minutes is required for --outcome stored and must equal the Hub's dedup window (a wrong value shortens or extends duplicate protection)");
+      return EXIT_USAGE;
+    }
     const ttlMinutes = positiveNumber(flags.get('ttl-minutes'), DEFAULT_RESOLVE_TTL_MINUTES);
     if (ttlMinutes === null) {
       io.err('--ttl-minutes must be a positive number');
@@ -146,7 +187,13 @@ export function runCli(argv: string[], options: CliOptions = {}): number {
     const note = typeof flags.get('note') === 'string' ? (flags.get('note') as string) : undefined;
 
     if (flags.get('yes') !== true) {
-      io.out(`Dry run only: no state changed. The store will validate that ${prefix} identifies exactly one UNKNOWN entry when applied.`);
+      const preview = store.inspectUnknown(prefix, { minAgeMs: minResolveAgeMs(), now });
+      io.out('Dry run only: no state changed.');
+      if (preview.ok) {
+        io.out(`Matched ${preview.hashPrefix}, quarantined ${age(preview.unknownSince, now)} ago; eligible for resolution.`);
+      } else {
+        io.out(`This would be REFUSED: ${REFUSAL_TEXT[preview.reason]}`);
+      }
       io.out(
         outcome === 'not_stored'
           ? 'NOT_STORED makes this content claimable again: a retry will write it. Confirm in the backend that no entry with this contentHash exists first.'
@@ -160,20 +207,13 @@ export function runCli(argv: string[], options: CliOptions = {}): number {
     const result = store.resolveUnknown(prefix, {
       outcome: outcome as UnknownOutcome,
       operator,
-      minAgeMs: DEFAULT_MIN_AGE_MINUTES * 60_000,
+      minAgeMs: minResolveAgeMs(),
       ttlMinutes,
       note,
       now,
     });
     if (!result.ok) {
-      const why: Record<string, string> = {
-        invalid_prefix: 'The hash prefix must be 8-64 hexadecimal characters.',
-        not_found: 'No UNKNOWN entry matches that prefix (it may already be resolved).',
-        ambiguous: 'More than one UNKNOWN entry matches; use a longer prefix.',
-        too_recent: `The entry was quarantined less than ${DEFAULT_MIN_AGE_MINUTES} minutes ago; a request may still be in flight.`,
-        missing_timestamp: 'The UNKNOWN entry has no quarantine timestamp; refusing to resolve corrupted or legacy state.',
-      };
-      io.err(`Refused: ${why[result.reason]}`);
+      io.err(`Refused: ${REFUSAL_TEXT[result.reason]}`);
       return EXIT_REFUSED;
     }
     io.out(`Resolved ${result.hashPrefix} as ${result.outcome} (recorded for audit as ${operator}).`);
@@ -183,8 +223,7 @@ export function runCli(argv: string[], options: CliOptions = {}): number {
   }
 }
 
-const invokedDirectly = process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
-if (invokedDirectly) {
+if (isEntrypoint(import.meta.url, process.argv[1])) {
   try {
     process.exitCode = runCli(process.argv.slice(2));
   } catch (error) {

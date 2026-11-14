@@ -157,7 +157,7 @@ export class AutoMemoryMiddleware {
       // Establish durable quarantine before invoking the external side effect.
       // If ownership was lost or the transition cannot be confirmed, fail closed:
       // no Brain request is dispatched.
-      if (!this.dedup.markUnknown(hash, reservationToken)) {
+      if (!this.dedup.markUnknown(hash, reservationToken, this.brainTimeoutMs * 2 + 1000)) {
         return { saved: false, reason: 'claim_lost', retryable: false };
       }
       keepClaim = true;

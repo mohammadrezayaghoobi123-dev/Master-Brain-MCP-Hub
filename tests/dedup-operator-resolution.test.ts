@@ -3,14 +3,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
 import { createDedupStore, createMemoryDedupStore, type DedupStore } from '../src/lib/dedup-store.js';
-import { runCli, EXIT_CONFIRM, EXIT_OK, EXIT_REFUSED, EXIT_USAGE } from '../src/cli/dedup-admin.js';
+import { runCli, isEntrypoint, minResolveAgeMs, EXIT_CONFIRM, EXIT_OK, EXIT_REFUSED, EXIT_USAGE } from '../src/cli/dedup-admin.js';
 import { AutoMemoryMiddleware } from '../src/middleware/auto-memory.js';
 import { _resetBrainClientForTests } from '../src/brain/client.js';
 
@@ -296,7 +296,8 @@ describe('dedup-admin CLI', () => {
     const code = runCli(['resolve', hex(101).slice(0, 12), '--outcome', 'not_stored'], { store, io, now: Date.now() + 60 * MIN });
     expect(code).toBe(EXIT_CONFIRM);
     expect(store.status(hex(101))).toBe('unknown');
-    expect(out.join('\n')).toContain('exactly one UNKNOWN entry');
+    expect(out.join('\n')).toContain('eligible for resolution');
+    expect(out.join('\n')).toContain(hex(101).slice(0, 12));
     expect(out.join('\n')).toContain('--yes');
   });
 
@@ -318,7 +319,7 @@ describe('dedup-admin CLI', () => {
     quarantine(store, hex(103));
     const args = ['resolve', hex(103).slice(0, 12), '--outcome', 'not_stored', '--yes'];
     expect(runCli(args, { store, io })).toBe(EXIT_REFUSED);
-    expect(err.join('\n')).toContain('less than 10 minutes');
+    expect(err.join('\n')).toContain('too recently');
     expect(store.status(hex(103))).toBe('unknown');
     expect(runCli([...args, '--min-age-minutes', '0.0001'], { store, io, now: Date.now() + MIN })).toBe(EXIT_USAGE);
     expect(err.join('\n')).toContain('cannot be lowered');
@@ -398,7 +399,7 @@ describe('quarantine log line', () => {
       });
       expect(received).toBe(1);
       expect(
-        dedup.resolveUnknown(entry.hashPrefix, { outcome: 'not_stored', operator: 'ops', minAgeMs: 0 })
+        dedup.resolveUnknown(entry.hashPrefix, { outcome: 'not_stored', operator: 'ops', minAgeMs: 0, now: Date.now() + 5 * MIN })
       ).toMatchObject({ ok: true });
       status = 201;
       await expect(middleware.processInteraction('log-req', 'log-res', { tool: 'api' })).rejects.toBeDefined();
@@ -407,5 +408,210 @@ describe('quarantine log line', () => {
       middleware.close();
       status = 500;
     }
+  });
+});
+
+describe('P11 review findings', () => {
+  const dirs: string[] = [];
+  const saved = { db: process.env.DEDUP_DB_PATH, data: process.env.DATA_DIR, timeout: process.env.BRAIN_TIMEOUT_MS };
+  const tmp = (): string => {
+    const d = mkdtempSync(join(tmpdir(), 'dedup-p11-'));
+    dirs.push(d);
+    return d;
+  };
+  afterEach(() => {
+    for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+    for (const [k, v] of [['DEDUP_DB_PATH', saved.db], ['DATA_DIR', saved.data], ['BRAIN_TIMEOUT_MS', saved.timeout]] as const) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  });
+
+  for (const backend of backends) {
+    it(`[${backend.name}] P11-1: an entry cannot be resolved before its request's own timeout budget elapsed`, () => {
+      const dir = tmp();
+      const store = backend.open(dir);
+      try {
+        const token = store.claim(hex(200), 5) as string;
+        store.markUnknown(hex(200), token, 2 * 60 * MIN + 1000); // 2h budget
+        const t0 = Date.now();
+        // minAgeMs satisfied (0), but the in-flight budget is not.
+        expect(store.resolveUnknown(hex(200), { outcome: 'not_stored', operator: 'ops', minAgeMs: 0, now: t0 + 60 * MIN })).toEqual({
+          ok: false,
+          reason: 'in_flight',
+        });
+        expect(store.status(hex(200))).toBe('unknown');
+        expect(store.resolveUnknown(hex(200), { outcome: 'not_stored', operator: 'ops', minAgeMs: 0, now: t0 + 3 * 60 * MIN })).toMatchObject({ ok: true });
+      } finally {
+        store.close();
+      }
+    });
+
+    it(`[${backend.name}] P11-5: inspectUnknown previews eligibility without changing state`, () => {
+      const dir = tmp();
+      const store = backend.open(dir);
+      try {
+        quarantine(store, hex(201, 'cd34ab12'));
+        quarantine(store, hex(202, 'cd34ab12'));
+        const t0 = Date.now();
+        expect(store.inspectUnknown('zz', { minAgeMs: 0 })).toEqual({ ok: false, reason: 'invalid_prefix' });
+        expect(store.inspectUnknown('ffffffffff', { minAgeMs: 0 })).toEqual({ ok: false, reason: 'not_found' });
+        expect(store.inspectUnknown('cd34ab12', { minAgeMs: 0 })).toEqual({ ok: false, reason: 'ambiguous' });
+        expect(store.inspectUnknown(hex(201, 'cd34ab12'), { minAgeMs: 10 * MIN, now: t0 })).toEqual({ ok: false, reason: 'too_recent' });
+        expect(store.inspectUnknown(hex(201, 'cd34ab12'), { minAgeMs: 10 * MIN, now: t0 + 20 * MIN })).toMatchObject({ ok: true });
+        expect(store.status(hex(201, 'cd34ab12'))).toBe('unknown');
+        expect(store.listResolutions()).toHaveLength(0);
+      } finally {
+        store.close();
+      }
+    });
+
+    it(`[${backend.name}] P11-6: operator and note drop bidi/format/C1 control characters`, () => {
+      const dir = tmp();
+      const store = backend.open(dir);
+      try {
+        quarantine(store, hex(203));
+        store.resolveUnknown(hex(203), {
+          outcome: 'not_stored',
+          operator: 'ev\u202eil\u0085ops\u2028x',
+          minAgeMs: 0,
+          note: 'a\u2066b\u200ec\u009fd',
+        });
+        const [record] = store.listResolutions();
+        for (const field of [record.operator, record.note ?? '']) {
+          expect(/[\u0085\u009f\u2028\u200e\u202e\u2066]/.test(field)).toBe(false);
+        }
+        expect(record.operator).toContain('ops');
+        expect(record.note).toContain('d');
+      } finally {
+        store.close();
+      }
+    });
+  }
+
+  it('P11-1: the age floor follows BRAIN_TIMEOUT_MS (2x + 1s), never below 10 minutes', () => {
+    delete process.env.BRAIN_TIMEOUT_MS;
+    expect(minResolveAgeMs()).toBe(10 * MIN);
+    process.env.BRAIN_TIMEOUT_MS = String(30 * MIN);
+    expect(minResolveAgeMs()).toBe(60 * MIN + 1000);
+  });
+
+  it('P11-1: the middleware persists a budget of at least twice BRAIN_TIMEOUT_MS when it quarantines', async () => {
+    process.env.BRAIN_TIMEOUT_MS = '5000';
+    const dedup = createMemoryDedupStore();
+    const spy = vi.spyOn(dedup, 'markUnknown');
+    const middleware = new AutoMemoryMiddleware({ enabled: true }, dedup);
+    (middleware as unknown as { analyzeImportance: () => Promise<unknown> }).analyzeImportance = async () => ({
+      isImportant: true, type: 'decision', summary: 's', tags: [], confidence: 0.95,
+    });
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      await middleware.processInteraction('budget-req', 'budget-res', { tool: 'api' }).catch(() => undefined);
+      expect(spy).toHaveBeenCalled();
+      expect((spy.mock.calls[0][2] ?? 0) >= 2 * 5000).toBe(true);
+    } finally {
+      middleware.close();
+      vi.restoreAllMocks();
+    }
+  });
+
+  it('P11-2: --outcome stored requires an explicit --ttl-minutes', () => {
+    const store = createMemoryDedupStore();
+    const err: string[] = [];
+    const io = { out: () => undefined, err: (l: string) => err.push(l) };
+    try {
+      quarantine(store, hex(204));
+      const base = ['resolve', hex(204).slice(0, 12), '--outcome', 'stored', '--yes'];
+      expect(runCli(base, { store, io, now: Date.now() + 60 * MIN })).toBe(EXIT_USAGE);
+      expect(err.join('\n')).toContain('--ttl-minutes is required');
+      expect(store.status(hex(204))).toBe('unknown');
+      expect(runCli([...base, '--ttl-minutes', '30'], { store, io, now: Date.now() + 60 * MIN })).toBe(EXIT_OK);
+      expect(store.status(hex(204))).toBe('committed');
+    } finally {
+      store.close();
+    }
+  });
+
+  it('P11-3: the CLI refuses to create a missing database and names the path it looked at', () => {
+    const dir = tmp();
+    const missing = join(dir, 'nope', 'dedup.sqlite');
+    process.env.DEDUP_DB_PATH = missing;
+    const err: string[] = [];
+    const code = runCli(['list'], { io: { out: () => undefined, err: (l) => err.push(l) } });
+    expect(code).toBe(EXIT_REFUSED);
+    expect(err.join('\n')).toContain(missing);
+    expect(err.join('\n')).toContain('DEDUP_DB_PATH');
+  });
+
+  it('P11-7: the CLI works end to end against a real SQLite database, and prints which one', () => {
+    const dir = tmp();
+    const path = join(dir, 'dedup.sqlite');
+    const seed = createDedupStore(path, { requireSqlite: true });
+    quarantine(seed, hex(205));
+    seed.close();
+    process.env.DEDUP_DB_PATH = path;
+    const out: string[] = [];
+    const err: string[] = [];
+    const io = { out: (l: string) => out.push(l), err: (l: string) => err.push(l) };
+    const later = Date.now() + 60 * MIN;
+    expect(runCli(['list'], { io, now: later })).toBe(EXIT_OK);
+    expect(out.join('\n')).toContain(path);
+    expect(out.join('\n')).toContain(hex(205).slice(0, 12));
+    expect(runCli(['resolve', hex(205).slice(0, 12), '--outcome', 'not_stored', '--yes', '--note', 'checked'], { io, now: later, operator: 'dana' })).toBe(EXIT_OK);
+    const check = createDedupStore(path, { requireSqlite: true });
+    try {
+      expect(check.status(hex(205))).toBeNull();
+      expect(check.listResolutions()[0]).toMatchObject({ operator: 'dana', outcome: 'not_stored' });
+    } finally {
+      check.close();
+    }
+  });
+
+  it('P11-7: an ambiguous prefix is refused with the right message and changes nothing', () => {
+    const store = createMemoryDedupStore();
+    const err: string[] = [];
+    try {
+      quarantine(store, hex(206, 'ee00ee00'));
+      quarantine(store, hex(207, 'ee00ee00'));
+      const code = runCli(['resolve', 'ee00ee00', '--outcome', 'not_stored', '--yes'], { store, io: { out: () => undefined, err: (l) => err.push(l) }, now: Date.now() + 60 * MIN });
+      expect(code).toBe(EXIT_REFUSED);
+      expect(err.join('\n')).toContain('longer prefix');
+      expect(store.listUnknown()).toHaveLength(2);
+    } finally {
+      store.close();
+    }
+  });
+
+  it('P11-7: if the audit insert fails the resolution is rolled back atomically (SQLite)', () => {
+    const dir = tmp();
+    const path = join(dir, 'dedup.sqlite');
+    const store = createDedupStore(path, { requireSqlite: true });
+    try {
+      quarantine(store, hex(208));
+      const Database = require('better-sqlite3');
+      const second = new Database(path);
+      second.exec("CREATE TRIGGER fail_audit BEFORE INSERT ON unknown_resolutions BEGIN SELECT RAISE(ABORT, 'audit down'); END;");
+      second.close();
+      expect(() => store.resolveUnknown(hex(208), { outcome: 'not_stored', operator: 'ops', minAgeMs: 0 })).toThrow();
+      expect(store.status(hex(208))).toBe('unknown'); // the DELETE was rolled back with the failed audit
+      expect(store.listResolutions()).toHaveLength(0);
+    } finally {
+      store.close();
+    }
+  });
+
+  it('P11-4: entrypoint detection works through a symlink (npm .bin) and rejects other files', () => {
+    const dir = tmp();
+    const real = join(dir, 'real.js');
+    writeFileSync(real, '');
+    const bin = join(dir, 'bin');
+    mkdirSync(bin);
+    const link = join(bin, 'dedup-admin');
+    symlinkSync(real, link);
+    const metaUrl = new URL(`file://${real}`).href;
+    expect(isEntrypoint(metaUrl, real)).toBe(true);
+    expect(isEntrypoint(metaUrl, link)).toBe(true);
+    expect(isEntrypoint(metaUrl, join(dir, 'other.js'))).toBe(false);
+    expect(isEntrypoint(metaUrl, undefined)).toBe(false);
   });
 });
