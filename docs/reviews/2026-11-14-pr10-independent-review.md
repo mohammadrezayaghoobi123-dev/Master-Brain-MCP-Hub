@@ -83,3 +83,8 @@ After the initial review:
 - Exact-head CI run `43562172251` completed successfully: Node 22, 24, and 26 typecheck/test/build jobs and npm audit all passed; each Node job ran 183 tests across 7 files.
 
 The initial procedural conditions in section 7 for accurate PR wording and exact-head CI have therefore been met. This does **not** upgrade PR5-F2 beyond PARTIALLY VERIFIED, establish ENOTFOUND/EAI_AGAIN behavior, or verify the Backend/runtime contract. PR #10 remains Draft and unmerged. This independent review does not authorize merging PR #10 into PR #5 or PR #5 into its base.
+
+
+## 9. Base-retarget verification note — 2026-11-14
+
+PR #10 was retargeted to PR #5's current head branch `fix/integration-regressions-pr4-2026-11-13` at `302ab1a711f5212372144860ba5fe2d4cdc23afd`. The branch graph remains diverged from that base (5 commits ahead / 6 behind; merge-base `788ee394bb95b58d4a8ab5b4c59b5e20caf84a99`). GitHub currently reports mergeable=true. The previously recorded CI run `43562252023` passed on the PR #10 head, but predates this base retarget and therefore does not verify the updated PR merge ref. A new exact merge-ref CI result and independent review are required before merge consideration.
