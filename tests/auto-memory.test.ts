@@ -527,7 +527,7 @@ describe('pre-dispatch transport recovery', () => {
           code: 'BRAIN_UNREACHABLE',
           details: { networkCode: 'ECONNREFUSED', requestDisposition: 'not_dispatched' },
         });
-      expect(dedup.status(contentHash('pre-dispatch req\\n---\\nres'))).toBeNull();
+      expect(dedup.status(contentHash('pre-dispatch req\n---\nres'))).toBeNull();
 
       await expect(mw.processInteraction('pre-dispatch req', 'res', { tool: 'manual' }))
         .resolves.toMatchObject({ saved: true });
@@ -552,7 +552,7 @@ describe('pre-dispatch transport recovery', () => {
     try {
       await expect(mw.processInteraction('ambiguous reset req', 'res', { tool: 'manual' }))
         .rejects.toMatchObject({ code: 'BRAIN_UNREACHABLE' });
-      expect(dedup.status(contentHash('ambiguous reset req\\n---\\nres'))).toBe('unknown');
+      expect(dedup.status(contentHash('ambiguous reset req\n---\nres'))).toBe('unknown');
       await expect(mw.processInteraction('ambiguous reset req', 'res', { tool: 'manual' }))
         .resolves.toMatchObject({ reason: 'outcome_unknown', retryable: false });
       expect(global.fetch).toHaveBeenCalledTimes(1);
