@@ -129,11 +129,12 @@ Quarantine is lifted only by an operator, through a CLI that needs file access t
 npm run dedup:admin -- list                                  # quarantined hash prefixes, oldest first
 npm run dedup:admin -- resolve <prefix> --outcome not_stored # dry run; add --yes to apply
 npm run dedup:admin -- resolve <prefix> --outcome stored --yes --note "found in backend"
-npm run dedup:admin -- audit                                 # append-only record of every resolution
+npm run dedup:admin -- audit                                 # application-level audit records
 ```
 
-- Check the backend first. Entries carry `metadata.contentHash`; look for one starting with the prefix. `not_stored` makes the content claimable again (a retry will write it); `stored` records it as committed for the dedup window. Resolving the wrong way causes a lost memory or a duplicate, and the Hub cannot verify your claim.
-- Resolution is one atomic, audited transaction on exactly one row identified by a unique 8-64 hex prefix. It never touches pending or committed rows, and refuses entries quarantined less than 10 minutes ago (`--min-age-minutes`) so an in-flight request is not resolved underneath its owner.
+- Check the backend first. Entries carry `metadata.contentHash`; look for one starting with the prefix. `not_stored` makes the content claimable again (a retry will write it); `stored` records it as committed for the dedup window. Resolving the wrong way causes a lost memory or a duplicate, and the Hub cannot verify your claim. `not_stored` must not be selected merely because the 10-minute guard elapsed.
+- Resolution is one atomic transaction with an application-level audit record on exactly one row identified by a unique 8-64 hex prefix. It never touches pending or committed rows. The CLI enforces a fixed 10-minute minimum age; this is only a delay, **not proof** that an in-flight request has completed. The operator must independently verify the backend and account for delayed/in-flight processing before choosing an outcome. The age guard cannot be lowered through the CLI.
+- The audit table is append-only through the application interface, but it is not tamper-proof against a process or operator with direct write access to the SQLite file. Do not treat it as an independently anchored or immutable audit log.
 - Whether the backend can actually answer "was this stored?" (and honors `Idempotency-Key`) is UNVERIFIED; this tool only makes the operator's decision possible and auditable.
 
 ## Environment
