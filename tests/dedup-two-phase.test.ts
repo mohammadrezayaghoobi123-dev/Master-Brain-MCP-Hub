@@ -822,3 +822,64 @@ describe('Idempotency-Key header', () => {
   });
 });
 
+describe('UNKNOWN recovery ownership', () => {
+  it.each([
+    ['memory', () => createMemoryDedupStore()],
+    ['sqlite', () => createDedupStore(dbPath)],
+  ])('%s store only reverts UNKNOWN for its exact owner', (_name, make) => {
+    const store = make();
+    const owner = store.claim('revert-h', 5)!;
+    expect(store.revertUnknown('revert-h', owner)).toBe(false);
+    expect(store.markUnknown('revert-h', owner)).toBe(true);
+    expect(store.revertUnknown('revert-h', 'stale-owner')).toBe(false);
+    expect(store.status('revert-h')).toBe('unknown');
+    expect(store.revertUnknown('revert-h', owner)).toBe(true);
+    expect(store.status('revert-h')).toBeNull();
+    store.close();
+  });
+});
+
+describe('production SQLite path configuration', () => {
+  it('fails closed without an explicit absolute DEDUP_DB_PATH or DATA_DIR', () => {
+    const original = {
+      NODE_ENV: process.env.NODE_ENV,
+      DEDUP_DB_PATH: process.env.DEDUP_DB_PATH,
+      DATA_DIR: process.env.DATA_DIR,
+    };
+    try {
+      process.env.NODE_ENV = 'production';
+      delete process.env.DEDUP_DB_PATH;
+      delete process.env.DATA_DIR;
+      expect(() => createDedupStore()).toThrow(/production requires an absolute DEDUP_DB_PATH or DATA_DIR/);
+      process.env.DATA_DIR = 'relative-data';
+      expect(() => createDedupStore()).toThrow(/production requires an absolute DEDUP_DB_PATH or DATA_DIR/);
+    } finally {
+      for (const [key, value] of Object.entries(original)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
+  it('accepts an absolute DATA_DIR in production', () => {
+    const original = {
+      NODE_ENV: process.env.NODE_ENV,
+      DEDUP_DB_PATH: process.env.DEDUP_DB_PATH,
+      DATA_DIR: process.env.DATA_DIR,
+    };
+    let store: DedupStore | undefined;
+    try {
+      process.env.NODE_ENV = 'production';
+      delete process.env.DEDUP_DB_PATH;
+      process.env.DATA_DIR = dir;
+      store = createDedupStore();
+      expect(store.backend).toBe('sqlite');
+    } finally {
+      store?.close();
+      for (const [key, value] of Object.entries(original)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+});
