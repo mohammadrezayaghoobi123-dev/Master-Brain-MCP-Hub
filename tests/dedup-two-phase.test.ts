@@ -248,6 +248,19 @@ describe.each([
 });
 
 describe('SQLite two-phase persistence', () => {
+  it('status treats an expired row as absent without running a global purge write', () => {
+    const store = createDedupStore(dbPath);
+    try {
+      expect(store.claim('expired-status', 1)).toEqual(expect.any(String));
+      advance(MIN + 1);
+      expect(store.status('expired-status')).toBeNull();
+      // The row remains available for the scheduled purge; status itself is read-only.
+      expect(store.purgeExpired()).toBe(1);
+    } finally {
+      store.close();
+    }
+  });
+
   it('pending, unknown, and committed entries survive a restart (reopen)', () => {
     const a = createDedupStore(dbPath);
     a.claim('pending-hash', 5);
