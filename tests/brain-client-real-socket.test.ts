@@ -1,6 +1,7 @@
 // Real-socket regression tests (no fetch mocks). They exercise Undici transport behavior
 // on every Node version in the CI matrix and falsify the redirect/pre-dispatch classification.
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { randomUUID } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
 import { createServer as createNetServer } from 'node:net';
 import type { AddressInfo } from 'node:net';
@@ -66,6 +67,14 @@ describe('BrainClient — real socket transport classification', () => {
     const error = await failure(client.save(ENTRY));
     expect(error.code).toBe('BRAIN_UNREACHABLE');
     expect(error.details?.networkCode).toBe('ECONNREFUSED');
+    expect(error.details?.requestDisposition).toBe('not_dispatched');
+  });
+
+  it('marks a real DNS ENOTFOUND from a reserved .invalid hostname as not_dispatched', async () => {
+    const host = `pr5-${randomUUID()}.invalid`;
+    const client = new BrainClient({ baseUrl: `http://${host}`, timeoutMs: 5000 });
+    const error = await failure(client.save(ENTRY));
+    expect(error.details?.networkCode).toBe('ENOTFOUND');
     expect(error.details?.requestDisposition).toBe('not_dispatched');
   });
 
