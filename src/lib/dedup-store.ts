@@ -279,6 +279,8 @@ class SqliteDedupStore implements DedupStore {
     // Bound lock contention to 100ms; callers fail closed on SQLITE_BUSY and may retry at the operation boundary.
     this.db = new Database(dbPath, { timeout: 100 });
     try {
+      // Serialize additive schema changes and make the entire migration atomic.
+      this.db.exec('BEGIN IMMEDIATE');
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS content_hashes (
           hash TEXT PRIMARY KEY,
@@ -312,7 +314,14 @@ class SqliteDedupStore implements DedupStore {
           note TEXT
         );
       `);
+      this.db.exec('COMMIT');
     } catch (error) {
+      // If any DDL step fails, restore the pre-migration schema before closing.
+      try {
+        this.db.exec('ROLLBACK');
+      } catch {
+        // BEGIN may have failed; preserve the original error.
+      }
       // A partially initialized native SQLite handle must never leak on schema/migration failure.
       try {
         this.db.close();

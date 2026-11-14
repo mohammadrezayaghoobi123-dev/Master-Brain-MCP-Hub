@@ -710,13 +710,13 @@ describe('SQLite multi-process atomicity', () => {
 });
 
 describe('SQLite constructor cleanup', () => {
-  it('closes the native handle when schema migration fails after open', () => {
-    let execCalls = 0;
+  it('rolls back and closes the native handle when schema migration fails after open', () => {
+    const statements: string[] = [];
     let closed = false;
     class FakeDatabase {
-      exec() {
-        execCalls += 1;
-        if (execCalls === 2) throw new Error('synthetic migration failure');
+      exec(sql: string) {
+        statements.push(sql);
+        if (statements.length === 2) throw new Error('synthetic migration failure');
       }
       close() {
         closed = true;
@@ -728,7 +728,8 @@ describe('SQLite constructor cleanup', () => {
         loadDriver: () => FakeDatabase,
       })
     ).toThrow(/SQLite is required.*synthetic migration failure/);
-    expect(execCalls).toBe(2);
+    expect(statements[0]).toBe('BEGIN IMMEDIATE');
+    expect(statements[2]).toBe('ROLLBACK');
     expect(closed).toBe(true);
   });
 });
