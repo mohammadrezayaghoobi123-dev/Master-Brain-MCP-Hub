@@ -52,12 +52,7 @@
 
 ### POST /api/brain/entries
 **Auth:** Bearer recommended  
-**Request headers:**
-- `Content-Type: application/json`
-- `Authorization: Bearer <token>` when configured
-- The Hub currently sends `Idempotency-Key: <content hash>` for Auto-Memory saves. This documents client behavior only; Backend support, key scope, retention, conflict behavior, and replay semantics are **UNVERIFIED**. Do not rely on this header for duplicate-write protection until the deployed Backend contract and implementation are independently confirmed.
-
-**Request body:**
+**Request:**
 ```json
 {
   "type": "decision|fix|learning|pattern|preference|config|error|context|conversation",
