@@ -30,7 +30,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 // Only these transport failures prove that Fetch never established a connection
 // and therefore could not have dispatched the HTTP request body.
-const DEFINITELY_PRE_DISPATCH_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN']);
+const DEFINITELY_PRE_DISPATCH_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND']);
 
 function getNetworkCauseCode(error: unknown): string | undefined {
   if (!isRecord(error) || !isRecord(error.cause)) return undefined;
