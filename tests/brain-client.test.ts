@@ -75,7 +75,7 @@ describe('BrainClient — API calls', () => {
       'http://localhost:3001/api/brain/entries',
       expect.objectContaining({ method: 'POST' })
     );
-    expect(result.id).toBe('123');
+    expect(result.id).toBe('123e4567-e89b-42d3-a456-426614174000');
   });
 
   it.each([
