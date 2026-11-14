@@ -48,7 +48,7 @@ const analysis = {
   confidence: 1,
 };
 const savedEntry = {
-  id: 'e1',
+  id: '123e4567-e89b-42d3-a456-426614174000',
   type: 'decision',
   content: analysis.summary,
   tags: analysis.tags,
