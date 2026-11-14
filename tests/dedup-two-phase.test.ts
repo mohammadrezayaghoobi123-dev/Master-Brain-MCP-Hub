@@ -577,6 +577,35 @@ describe('observability', () => {
   });
 });
 
+describe('SQLite busy-lock behavior', () => {
+  it('fails closed without blocking the event loop for the default five-second SQLite timeout', () => {
+    const store = createDedupStore(dbPath, { requireSqlite: true });
+    const Database = require('better-sqlite3') as new (path: string) => {
+      exec(sql: string): void;
+      close(): void;
+    };
+    const blocker = new Database(dbPath);
+    blocker.exec('BEGIN EXCLUSIVE');
+    const started = performance.now();
+
+    try {
+      expect(() => store.claim('busy-lock-hash', 1)).toThrow(/SQLITE_BUSY|database is locked/i);
+      expect(performance.now() - started).toBeLessThan(250);
+    } finally {
+      blocker.exec('ROLLBACK');
+      blocker.close();
+      store.close();
+    }
+
+    const recovered = createDedupStore(dbPath, { requireSqlite: true });
+    try {
+      expect(recovered.claim('busy-lock-hash', 1)).toEqual(expect.any(String));
+    } finally {
+      recovered.close();
+    }
+  }, 10_000);
+});
+
 describe('SQLite multi-process atomicity', () => {
   it('allows exactly one independent Node process to claim the same hash', async () => {
     // Initialize schema before racing so this test isolates claim atomicity, not DDL startup.
