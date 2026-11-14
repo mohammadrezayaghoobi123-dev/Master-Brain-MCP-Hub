@@ -195,6 +195,13 @@ export class AutoMemoryMiddleware {
             this.logDedupError('revert-unknown', revertError);
           }
         }
+        if (keepClaim) {
+          // Operators reconcile quarantined writes by hash prefix (never the full hash or token).
+          console.error(
+            `[AutoMemory] write left in UNKNOWN quarantine (hash ${hash.slice(0, 12)}); ` +
+              'verify against the backend, then resolve with: npm run dedup:admin -- list'
+          );
+        }
         throw error;
       }
 

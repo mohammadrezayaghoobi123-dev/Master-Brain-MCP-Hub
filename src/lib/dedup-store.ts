@@ -19,6 +19,42 @@ const require = createRequire(import.meta.url);
 
 export type DedupState = 'pending' | 'unknown' | 'committed';
 
+/** What an operator established, out of band, about a quarantined (UNKNOWN) write. */
+export type UnknownOutcome = 'not_stored' | 'stored';
+
+export interface UnknownEntrySummary {
+  /** First 12 hex characters of the content hash; the full hash is never exposed. */
+  hashPrefix: string;
+  unknownSince: number | null;
+}
+
+export interface ResolveUnknownOptions {
+  outcome: UnknownOutcome;
+  /** Operator identity recorded in the audit trail. */
+  operator: string;
+  /** Refuse entries quarantined more recently than this, so an in-flight request is never resolved. */
+  minAgeMs: number;
+  /** Retention of a `stored` outcome as a committed entry (minutes). Defaults to 30. */
+  ttlMinutes?: number;
+  note?: string;
+  now?: number;
+}
+
+export type ResolveUnknownResult =
+  | { ok: true; hashPrefix: string; outcome: UnknownOutcome }
+  | { ok: false; reason: 'invalid_prefix' | 'not_found' | 'ambiguous' | 'too_recent' };
+
+export interface ResolutionRecord {
+  at: number;
+  hashPrefix: string;
+  outcome: UnknownOutcome;
+  operator: string;
+  note: string | null;
+}
+
+const HASH_PREFIX_PATTERN = /^[0-9a-f]{8,64}$/;
+export const DEFAULT_RESOLVE_TTL_MINUTES = 30;
+
 export interface DedupStore {
   /** Which backend is actually in use (observability: memory means no cross-process dedup). */
   readonly backend: 'sqlite' | 'memory';
@@ -40,6 +76,16 @@ export interface DedupStore {
   add(hash: string, ttlMinutes: number): void;
   /** Safe operational summary of quarantined UNKNOWN rows; never exposes hashes or owner tokens. */
   unknownStats(): { count: number; oldestAt: number | null };
+  /** Operator-only (CLI, never an MCP tool): quarantined rows, oldest first, hash prefixes only. */
+  listUnknown(limit?: number): UnknownEntrySummary[];
+  /**
+   * Operator-only, atomic and audited resolution of exactly one UNKNOWN row identified by a unique
+   * hash prefix. `not_stored` makes the content claimable again; `stored` commits it. Never touches
+   * pending or committed rows.
+   */
+  resolveUnknown(hashPrefix: string, options: ResolveUnknownOptions): ResolveUnknownResult;
+  /** Operator-only: most recent resolutions first. */
+  listResolutions(limit?: number): ResolutionRecord[];
   purgeExpired(): number;
   size(): number;
   close(): void;
@@ -55,6 +101,7 @@ interface MemoryEntry {
 class MemoryDedupStore implements DedupStore {
   readonly backend = 'memory' as const;
   private readonly entries = new Map<string, MemoryEntry>();
+  private readonly resolutions: ResolutionRecord[] = [];
 
   private live(hash: string): MemoryEntry | undefined {
     const e = this.entries.get(hash);
@@ -142,6 +189,50 @@ class MemoryDedupStore implements DedupStore {
     return { count, oldestAt };
   }
 
+  listUnknown(limit = 100): UnknownEntrySummary[] {
+    return [...this.entries.entries()]
+      .filter(([, entry]) => entry.state === 'unknown')
+      .map(([hash, entry]) => ({ hashPrefix: hash.slice(0, 12), unknownSince: entry.unknownSince }))
+      .sort((a, b) => (a.unknownSince ?? 0) - (b.unknownSince ?? 0))
+      .slice(0, normalizeLimit(limit));
+  }
+
+  resolveUnknown(hashPrefix: string, options: ResolveUnknownOptions): ResolveUnknownResult {
+    const prefix = normalizePrefix(hashPrefix);
+    if (!prefix) return { ok: false, reason: 'invalid_prefix' };
+    const matches = [...this.entries.entries()].filter(
+      ([hash, entry]) => entry.state === 'unknown' && hash.startsWith(prefix)
+    );
+    if (matches.length === 0) return { ok: false, reason: 'not_found' };
+    if (matches.length > 1) return { ok: false, reason: 'ambiguous' };
+    const [hash, entry] = matches[0];
+    const now = options.now ?? Date.now();
+    if (entry.unknownSince !== null && now - entry.unknownSince < options.minAgeMs) {
+      return { ok: false, reason: 'too_recent' };
+    }
+    const expiresAt =
+      options.outcome === 'stored'
+        ? expiresAtForTtl(options.ttlMinutes ?? DEFAULT_RESOLVE_TTL_MINUTES, now)
+        : 0;
+    if (options.outcome === 'stored') {
+      this.entries.set(hash, { exp: expiresAt, state: 'committed', owner: null, unknownSince: null });
+    } else {
+      this.entries.delete(hash);
+    }
+    this.resolutions.unshift({
+      at: now,
+      hashPrefix: hash.slice(0, 12),
+      outcome: options.outcome,
+      operator: normalizeOperator(options.operator),
+      note: normalizeNote(options.note),
+    });
+    return { ok: true, hashPrefix: hash.slice(0, 12), outcome: options.outcome };
+  }
+
+  listResolutions(limit = 100): ResolutionRecord[] {
+    return this.resolutions.slice(0, normalizeLimit(limit));
+  }
+
   purgeExpired(): number {
     const now = Date.now();
     let n = 0;
@@ -176,6 +267,7 @@ class SqliteDedupStore implements DedupStore {
       exec(sql: string): void;
       prepare(sql: string): {
         get(...params: unknown[]): unknown;
+        all(...params: unknown[]): unknown[];
         run(...params: unknown[]): { changes: number };
       };
       close(): void;
@@ -206,6 +298,17 @@ class SqliteDedupStore implements DedupStore {
       this.db.exec(
         'CREATE INDEX IF NOT EXISTS idx_hashes_state_unknown_since ON content_hashes(state, unknown_since)'
       );
+      // Append-only operator audit trail; additive, so older binaries ignore it.
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS unknown_resolutions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          at INTEGER NOT NULL,
+          hash_prefix TEXT NOT NULL,
+          outcome TEXT NOT NULL,
+          operator TEXT NOT NULL,
+          note TEXT
+        );
+      `);
     } catch (error) {
       // A partially initialized native SQLite handle must never leak on schema/migration failure.
       try {
@@ -297,6 +400,85 @@ class SqliteDedupStore implements DedupStore {
     return { count: row.count, oldestAt: row.oldestAt ?? null };
   }
 
+  listUnknown(limit = 100): UnknownEntrySummary[] {
+    const rows = this.db
+      .prepare(
+        "SELECT substr(hash, 1, 12) AS hashPrefix, unknown_since AS unknownSince FROM content_hashes WHERE state = 'unknown' ORDER BY unknown_since ASC LIMIT ?"
+      )
+      .all(normalizeLimit(limit)) as Array<{ hashPrefix: string; unknownSince: number | null }>;
+    return rows.map((row) => ({ hashPrefix: row.hashPrefix, unknownSince: row.unknownSince ?? null }));
+  }
+
+  resolveUnknown(hashPrefix: string, options: ResolveUnknownOptions): ResolveUnknownResult {
+    const prefix = normalizePrefix(hashPrefix);
+    if (!prefix) return { ok: false, reason: 'invalid_prefix' };
+    const now = options.now ?? Date.now();
+    const ttlExpiry =
+      options.outcome === 'stored'
+        ? expiresAtForTtl(options.ttlMinutes ?? DEFAULT_RESOLVE_TTL_MINUTES, now)
+        : null;
+    // One immediate (write-locked) transaction: lookup, state change and audit row commit together.
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const rows = this.db
+        .prepare(
+          "SELECT hash, unknown_since AS unknownSince FROM content_hashes WHERE state = 'unknown' AND substr(hash, 1, ?) = ? LIMIT 2"
+        )
+        .all(prefix.length, prefix) as Array<{ hash: string; unknownSince: number | null }>;
+      let result: ResolveUnknownResult;
+      if (rows.length === 0) result = { ok: false, reason: 'not_found' };
+      else if (rows.length > 1) result = { ok: false, reason: 'ambiguous' };
+      else if (rows[0].unknownSince !== null && now - rows[0].unknownSince < options.minAgeMs) {
+        result = { ok: false, reason: 'too_recent' };
+      } else {
+        const { hash } = rows[0];
+        const changed =
+          ttlExpiry === null
+            ? this.db.prepare("DELETE FROM content_hashes WHERE hash = ? AND state = 'unknown'").run(hash)
+            : this.db
+                .prepare(
+                  `UPDATE content_hashes SET state = 'committed', owner = NULL, expires_at = ?, unknown_since = NULL
+                   WHERE hash = ? AND state = 'unknown'`
+                )
+                .run(ttlExpiry, hash);
+        if (changed.changes !== 1) {
+          result = { ok: false, reason: 'not_found' };
+        } else {
+          this.db
+            .prepare(
+              'INSERT INTO unknown_resolutions(at, hash_prefix, outcome, operator, note) VALUES(?, ?, ?, ?, ?)'
+            )
+            .run(now, hash.slice(0, 12), options.outcome, normalizeOperator(options.operator), normalizeNote(options.note));
+          result = { ok: true, hashPrefix: hash.slice(0, 12), outcome: options.outcome };
+        }
+      }
+      this.db.exec('COMMIT');
+      return result;
+    } catch (error) {
+      try {
+        this.db.exec('ROLLBACK');
+      } catch {
+        // Preserve the original failure.
+      }
+      throw error;
+    }
+  }
+
+  listResolutions(limit = 100): ResolutionRecord[] {
+    const rows = this.db
+      .prepare(
+        'SELECT at, hash_prefix AS hashPrefix, outcome, operator, note FROM unknown_resolutions ORDER BY id DESC LIMIT ?'
+      )
+      .all(normalizeLimit(limit)) as Array<{
+      at: number;
+      hashPrefix: string;
+      outcome: UnknownOutcome;
+      operator: string;
+      note: string | null;
+    }>;
+    return rows.map((row) => ({ ...row, note: row.note ?? null }));
+  }
+
   purgeExpired(): number {
     const result = this.db
       .prepare("DELETE FROM content_hashes WHERE state != 'unknown' AND expires_at < ?")
@@ -314,6 +496,27 @@ class SqliteDedupStore implements DedupStore {
   close(): void {
     this.db.close();
   }
+}
+
+function normalizePrefix(value: string): string | null {
+  const prefix = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  return HASH_PREFIX_PATTERN.test(prefix) ? prefix : null;
+}
+
+function normalizeLimit(limit: number): number {
+  return Number.isInteger(limit) && limit > 0 ? Math.min(limit, 1000) : 100;
+}
+
+/** Audit fields are bounded and stripped of control characters (log/terminal injection). */
+function normalizeOperator(value: string): string {
+  const cleaned = String(value ?? '').replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 64);
+  return cleaned || 'unknown';
+}
+
+function normalizeNote(value: string | undefined): string | null {
+  if (value === undefined) return null;
+  const cleaned = String(value).replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 200);
+  return cleaned || null;
 }
 
 /** Claim leases must be exactly representable and never exceed the protocol's 24-hour bound. */
