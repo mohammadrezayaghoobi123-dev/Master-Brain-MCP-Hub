@@ -26,8 +26,6 @@ export interface UnknownEntrySummary {
   /** First 12 hex characters of the content hash; the full hash is never exposed. */
   hashPrefix: string;
   unknownSince: number | null;
-  /** Earliest time an operator may resolve this UNKNOWN (the request cannot still be in flight). */
-  resolveNotBefore?: number | null;
 }
 
 export interface ResolveUnknownOptions {
@@ -105,6 +103,8 @@ interface MemoryEntry {
   state: DedupState;
   owner: string | null;
   unknownSince: number | null;
+  /** Earliest time an operator may resolve this UNKNOWN (the request cannot still be in flight). */
+  resolveNotBefore?: number | null;
 }
 
 class MemoryDedupStore implements DedupStore {
