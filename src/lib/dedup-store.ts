@@ -12,7 +12,7 @@
 import { createRequire } from 'node:module';
 import { randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
 import { leaseMinutesToMs, MAX_EFFECTIVE_LEASE_MS } from './time-budget.js';
 
 const require = createRequire(import.meta.url);
@@ -30,6 +30,8 @@ export interface DedupStore {
   claim(hash: string, leaseMinutes: number): string | null;
   /** Atomically quarantine the current owner's pending claim before external write dispatch. */
   markUnknown(hash: string, token: string): boolean;
+  /** Remove UNKNOWN only when the same owner proves the request was never dispatched. */
+  revertUnknown(hash: string, token: string): boolean;
   /** Commit only the matching current owner; stale owners must never overwrite another claim. */
   commit(hash: string, token: string, ttlMinutes: number): boolean;
   /** Deletes the entry only if it is still the caller's PENDING reservation. UNKNOWN is never released. */
@@ -86,6 +88,13 @@ class MemoryDedupStore implements DedupStore {
     e.state = 'unknown';
     e.exp = Number.POSITIVE_INFINITY;
     e.unknownSince = Date.now();
+    return true;
+  }
+
+  revertUnknown(hash: string, token: string): boolean {
+    const entry = this.entries.get(hash);
+    if (!entry || entry.state !== 'unknown' || entry.owner !== token) return false;
+    this.entries.delete(hash);
     return true;
   }
 
@@ -244,6 +253,13 @@ class SqliteDedupStore implements DedupStore {
     return result.changes === 1;
   }
 
+  revertUnknown(hash: string, token: string): boolean {
+    const result = this.db
+      .prepare("DELETE FROM content_hashes WHERE hash = ? AND state = 'unknown' AND owner = ?")
+      .run(hash, token);
+    return result.changes === 1;
+  }
+
   commit(hash: string, token: string, ttlMinutes: number): boolean {
     const now = Date.now();
     const expiresAt = expiresAtForTtl(ttlMinutes, now);
@@ -338,10 +354,20 @@ export function createDedupStore(explicitPath?: string, options: CreateDedupStor
     process.env.NODE_ENV === 'production' ||
     options.requireSqlite === true ||
     ['1', 'true'].includes((process.env.DEDUP_REQUIRE_SQLITE ?? '').toLowerCase());
+  const configuredDbPath = process.env.DEDUP_DB_PATH?.trim();
+  const configuredDataDir = process.env.DATA_DIR?.trim();
+  const configuredEnvPath = configuredDbPath ||
+    (configuredDataDir ? join(configuredDataDir, '.data', 'auto-memory-dedup.sqlite') : undefined);
   const path =
     explicitPath ||
-    process.env.DEDUP_DB_PATH ||
-    join(process.env.DATA_DIR || process.cwd(), '.data', 'auto-memory-dedup.sqlite');
+    configuredEnvPath ||
+    join(process.cwd(), '.data', 'auto-memory-dedup.sqlite');
+
+  if (requireSqlite && (!configuredEnvPath || !isAbsolute(configuredEnvPath))) {
+    throw new Error(
+      '[DedupStore] production requires an absolute DEDUP_DB_PATH or DATA_DIR; refusing a cwd-dependent SQLite location'
+    );
+  }
 
   try {
     return new SqliteDedupStore(path, options.loadDriver);
