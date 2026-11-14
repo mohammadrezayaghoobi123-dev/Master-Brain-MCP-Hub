@@ -94,7 +94,7 @@ A stale owner cannot commit, release, or revert another owner's row. A confirmed
 
 ### Operational constraints
 
-- Production requires SQLite and an explicit absolute `DEDUP_DB_PATH` or absolute `DATA_DIR`; cwd-dependent paths are rejected.
+- Production requires SQLite and an absolute database path supplied through `DEDUP_DB_PATH`, `DATA_DIR`, or the explicit store-constructor path; cwd-dependent and relative paths are rejected.
 - In-memory fallback is not suitable for production: it does not survive restart and does not coordinate across processes.
 - `unknownStats()` exposes only the count and oldest timestamp of quarantined rows; it does not expose hashes or owner tokens.
 - SQLite operations use synchronous `better-sqlite3` calls. Busy-lock behavior and event-loop impact have not yet been benchmarked under production contention.
