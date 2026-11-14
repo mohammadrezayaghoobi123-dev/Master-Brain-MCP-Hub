@@ -28,6 +28,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+// Only these transport failures prove that Fetch never established a connection
+// and therefore could not have dispatched the HTTP request body.
+const DEFINITELY_PRE_DISPATCH_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN']);
+
+function getNetworkCauseCode(error: unknown): string | undefined {
+  if (!isRecord(error) || !isRecord(error.cause)) return undefined;
+  return typeof error.cause.code === 'string' ? error.cause.code : undefined;
+}
+
 /** The API contract requires a complete BrainEntry before a save is treated as confirmed. */
 function isBrainEntry(value: unknown): value is BrainEntry {
   if (!isRecord(value)) return false;
@@ -120,10 +129,17 @@ export class BrainClient {
           endpoint,
         });
       }
+      const networkCode = getNetworkCauseCode(error);
+      const definitelyNotDispatched =
+        networkCode !== undefined && DEFINITELY_PRE_DISPATCH_CODES.has(networkCode);
       throw new AppError(
         'BRAIN_UNREACHABLE',
         error instanceof Error ? error.message : 'Brain unreachable',
-        { endpoint }
+        {
+          endpoint,
+          ...(networkCode ? { networkCode } : {}),
+          ...(definitelyNotDispatched ? { requestDisposition: 'not_dispatched' } : {}),
+        }
       );
     } finally {
       clearTimeout(timeoutId);
