@@ -161,18 +161,42 @@ export class AutoMemoryMiddleware {
         return { saved: false, reason: 'claim_lost', retryable: false };
       }
       keepClaim = true;
-      await brain.save({
-        type: analysis.type,
-        content: analysis.summary,
-        tags: analysis.tags,
-        source: { ...source, tool: source.tool === 'manual' ? 'manual' : 'auto-memory' },
-        metadata: {
-          confidence: analysis.confidence,
-          originalRequest: request.substring(0, 500),
-          context: analysis.context,
-          contentHash: hash,
-        },
-      });
+      try {
+        await brain.save({
+          type: analysis.type,
+          content: analysis.summary,
+          tags: analysis.tags,
+          source: { ...source, tool: source.tool === 'manual' ? 'manual' : 'auto-memory' },
+          metadata: {
+            confidence: analysis.confidence,
+            originalRequest: request.substring(0, 500),
+            context: analysis.context,
+            contentHash: hash,
+          },
+        });
+      } catch (error) {
+        // Re-open the retry path only when the HTTP client can prove no connection
+        // was established. Timeouts, resets, HTTP errors and malformed 2xx bodies
+        // remain quarantined because the backend may already have committed.
+        const details = error instanceof AppError ? error.details : undefined;
+        if (details?.requestDisposition === 'not_dispatched') {
+          try {
+            const reverted = this.dedup.revertUnknown(hash, reservationToken);
+            if (reverted) {
+              keepClaim = false;
+            } else {
+              this.logDedupError(
+                'revert-unknown',
+                new Error('Pre-dispatch failure could not revert the matching UNKNOWN owner row')
+              );
+            }
+          } catch (revertError) {
+            // Preserve the original network failure and retain UNKNOWN on local-store failure.
+            this.logDedupError('revert-unknown', revertError);
+          }
+        }
+        throw error;
+      }
 
       // The brain save is durable at this point: promote the claim to committed
       // and account for the entry even if the dedup store misbehaves.
