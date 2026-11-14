@@ -25,7 +25,7 @@ describe('UNKNOWN quarantine aggregate alerts', () => {
       vi.advanceTimersByTime(5 * 60_000);
       expect(alert).toHaveBeenCalledTimes(1);
       expect(alert.mock.calls[0][0]).toContain('10 UNKNOWN write(s)');
-      expect(alert.mock.calls[0][0]).toContain('oldest age 0m');
+      expect(alert.mock.calls[0][0]).toContain('oldest age 5m');
       expect(alert.mock.calls[0][0]).not.toMatch(/unknown-\d/);
 
       vi.advanceTimersByTime(10 * 60_000);
