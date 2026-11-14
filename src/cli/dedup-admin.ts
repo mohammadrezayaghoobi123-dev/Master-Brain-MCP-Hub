@@ -40,7 +40,7 @@ const USAGE = [
   'Usage:',
   '  dedup-admin list',
   '  dedup-admin resolve <hash-prefix> --outcome not_stored|stored [--note TEXT]',
-  `                      [--min-age-minutes N (default ${DEFAULT_MIN_AGE_MINUTES})] [--ttl-minutes N (stored only, default ${DEFAULT_RESOLVE_TTL_MINUTES})] [--yes]`,
+  `                      [--ttl-minutes N (stored only, default ${DEFAULT_RESOLVE_TTL_MINUTES})] [--yes]`,
   '  dedup-admin audit [--limit N]',
 ].join('\n');
 
@@ -134,17 +134,19 @@ export function runCli(argv: string[], options: CliOptions = {}): number {
       io.err(USAGE);
       return EXIT_USAGE;
     }
-    const minAgeMinutes = positiveNumber(flags.get('min-age-minutes'), DEFAULT_MIN_AGE_MINUTES);
     const ttlMinutes = positiveNumber(flags.get('ttl-minutes'), DEFAULT_RESOLVE_TTL_MINUTES);
-    if (minAgeMinutes === null || ttlMinutes === null) {
-      io.err('--min-age-minutes and --ttl-minutes must be positive numbers');
+    if (ttlMinutes === null) {
+      io.err('--ttl-minutes must be a positive number');
+      return EXIT_USAGE;
+    }
+    if (flags.has('min-age-minutes')) {
+      io.err('--min-age-minutes is fixed at 10 minutes and cannot be lowered; elapsed time is not proof that a request completed');
       return EXIT_USAGE;
     }
     const note = typeof flags.get('note') === 'string' ? (flags.get('note') as string) : undefined;
 
-    const candidates = store.listUnknown(1000).filter((row) => row.hashPrefix.startsWith(prefix.toLowerCase().slice(0, 12)));
     if (flags.get('yes') !== true) {
-      io.out(`Dry run: would resolve ${candidates.length} matching UNKNOWN entr${candidates.length === 1 ? 'y' : 'ies'} as ${outcome}.`);
+      io.out(`Dry run only: no state changed. The store will validate that ${prefix} identifies exactly one UNKNOWN entry when applied.`);
       io.out(
         outcome === 'not_stored'
           ? 'NOT_STORED makes this content claimable again: a retry will write it. Confirm in the backend that no entry with this contentHash exists first.'
@@ -158,7 +160,7 @@ export function runCli(argv: string[], options: CliOptions = {}): number {
     const result = store.resolveUnknown(prefix, {
       outcome: outcome as UnknownOutcome,
       operator,
-      minAgeMs: minAgeMinutes * 60_000,
+      minAgeMs: DEFAULT_MIN_AGE_MINUTES * 60_000,
       ttlMinutes,
       note,
       now,
@@ -168,7 +170,8 @@ export function runCli(argv: string[], options: CliOptions = {}): number {
         invalid_prefix: 'The hash prefix must be 8-64 hexadecimal characters.',
         not_found: 'No UNKNOWN entry matches that prefix (it may already be resolved).',
         ambiguous: 'More than one UNKNOWN entry matches; use a longer prefix.',
-        too_recent: `The entry was quarantined less than ${minAgeMinutes} minutes ago; a request may still be in flight. Wait, or lower --min-age-minutes deliberately.`,
+        too_recent: `The entry was quarantined less than ${DEFAULT_MIN_AGE_MINUTES} minutes ago; a request may still be in flight.`,
+        missing_timestamp: 'The UNKNOWN entry has no quarantine timestamp; refusing to resolve corrupted or legacy state.',
       };
       io.err(`Refused: ${why[result.reason]}`);
       return EXIT_REFUSED;
