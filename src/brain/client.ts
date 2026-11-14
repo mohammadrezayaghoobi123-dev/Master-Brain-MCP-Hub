@@ -94,9 +94,15 @@ export class BrainClient {
     const timeoutId = setTimeout(() => controller.abort(), this.timeoutMs);
 
     try {
+      // A followed redirect would let a transport error on the *redirect target*
+      // (ECONNREFUSED/ENOTFOUND) be misread as "the request was never dispatched"
+      // although the first hop already received the body. Non-idempotent requests
+      // therefore never follow redirects; a 3xx surfaces as an ambiguous failure.
+      const isReadOnly = (options.method ?? 'GET').toUpperCase() === 'GET';
       const response = await fetch(url, {
         ...options,
         headers,
+        redirect: isReadOnly ? 'follow' : 'error',
         signal: controller.signal,
       });
 
