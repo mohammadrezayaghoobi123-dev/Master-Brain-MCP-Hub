@@ -488,3 +488,77 @@ describe('AutoMemoryMiddleware durable-save recovery', () => {
     }
   });
 });
+
+describe('pre-dispatch transport recovery', () => {
+  const analysis = {
+    isImportant: true,
+    type: 'decision' as const,
+    summary: 'Retry after a proven pre-dispatch failure',
+    tags: ['pre-dispatch'],
+    confidence: 1,
+  };
+
+  it('releases UNKNOWN only for a transport error proving no connection was established', async () => {
+    const dedup = memoryDedup();
+    const mw = new AutoMemoryMiddleware({ enabled: true, minConfidence: 0.7 }, dedup);
+    vi.spyOn(mw as any, 'analyzeImportance').mockResolvedValue(analysis);
+    _resetBrainClientForTests();
+
+    const refused = Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' });
+    const fetchFailure = Object.assign(new TypeError('fetch failed'), { cause: refused });
+    global.fetch = vi.fn()
+      .mockRejectedValueOnce(fetchFailure)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 201,
+        json: async () => ({
+          id: 'entry-after-retry',
+          type: 'decision',
+          content: analysis.summary,
+          tags: analysis.tags,
+          timestamp: new Date().toISOString(),
+          source: { tool: 'manual' },
+        }),
+      }) as unknown as typeof fetch;
+
+    try {
+      await expect(mw.processInteraction('pre-dispatch req', 'res', { tool: 'manual' }))
+        .rejects.toMatchObject({
+          code: 'BRAIN_UNREACHABLE',
+          details: { networkCode: 'ECONNREFUSED', requestDisposition: 'not_dispatched' },
+        });
+      expect(dedup.status(contentHash('pre-dispatch req\\n---\\nres'))).toBeNull();
+
+      await expect(mw.processInteraction('pre-dispatch req', 'res', { tool: 'manual' }))
+        .resolves.toMatchObject({ saved: true });
+      expect(global.fetch).toHaveBeenCalledTimes(2);
+    } finally {
+      mw.close();
+      _resetBrainClientForTests();
+    }
+  });
+
+  it('does not reopen retry after ECONNRESET because dispatch may already have happened', async () => {
+    const dedup = memoryDedup();
+    const mw = new AutoMemoryMiddleware({ enabled: true, minConfidence: 0.7 }, dedup);
+    vi.spyOn(mw as any, 'analyzeImportance').mockResolvedValue(analysis);
+    _resetBrainClientForTests();
+
+    const reset = Object.assign(new Error('connection reset'), { code: 'ECONNRESET' });
+    global.fetch = vi.fn().mockRejectedValue(
+      Object.assign(new TypeError('fetch failed'), { cause: reset })
+    ) as unknown as typeof fetch;
+
+    try {
+      await expect(mw.processInteraction('ambiguous reset req', 'res', { tool: 'manual' }))
+        .rejects.toMatchObject({ code: 'BRAIN_UNREACHABLE' });
+      expect(dedup.status(contentHash('ambiguous reset req\\n---\\nres'))).toBe('unknown');
+      await expect(mw.processInteraction('ambiguous reset req', 'res', { tool: 'manual' }))
+        .resolves.toMatchObject({ reason: 'outcome_unknown', retryable: false });
+      expect(global.fetch).toHaveBeenCalledTimes(1);
+    } finally {
+      mw.close();
+      _resetBrainClientForTests();
+    }
+  });
+});
