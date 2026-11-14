@@ -6,7 +6,58 @@ import type {
   MemoryType,
   SearchResult,
 } from '../types/index.js';
+import { MEMORY_TYPES } from '../types/index.js';
 import { AppError } from '../lib/errors.js';
+import {
+  assertPositiveSafeIntegerMs,
+  DEFAULT_BRAIN_TIMEOUT_MS,
+  parsePositiveSafeIntegerEnv,
+} from '../lib/time-budget.js';
+
+
+const MEMORY_SOURCE_TOOLS = new Set([
+  'claude-code',
+  'codex',
+  'cursor',
+  'api',
+  'manual',
+  'auto-memory',
+]);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+// Only these transport failures prove that Fetch never established a connection
+// and therefore could not have dispatched the HTTP request body.
+const DEFINITELY_PRE_DISPATCH_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN']);
+
+function getNetworkCauseCode(error: unknown): string | undefined {
+  if (!isRecord(error) || !isRecord(error.cause)) return undefined;
+  return typeof error.cause.code === 'string' ? error.cause.code : undefined;
+}
+
+/** The API contract requires a complete BrainEntry before a save is treated as confirmed. */
+function isBrainEntry(value: unknown): value is BrainEntry {
+  if (!isRecord(value)) return false;
+  if (typeof value.id !== 'string' || value.id.trim().length === 0) return false;
+  if (typeof value.type !== 'string' || !MEMORY_TYPES.includes(value.type as MemoryType)) return false;
+  if (typeof value.content !== 'string') return false;
+  if (!Array.isArray(value.tags) || !value.tags.every((tag) => typeof tag === 'string')) return false;
+  if (!isRecord(value.source) || typeof value.source.tool !== 'string') return false;
+  if (!MEMORY_SOURCE_TOOLS.has(value.source.tool)) return false;
+
+  const source = value.source as Record<string, unknown>;
+  for (const key of ['session_id', 'project', 'file', 'user_id'] as const) {
+    if (source[key] !== undefined && typeof source[key] !== 'string') return false;
+  }
+  if (typeof value.timestamp !== 'string') return false;
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value.timestamp)) return false;
+  if (!Number.isFinite(Date.parse(value.timestamp))) return false;
+  if (value.summary !== undefined && typeof value.summary !== 'string') return false;
+  if (value.metadata !== undefined && !isRecord(value.metadata)) return false;
+  return true;
+}
 
 export interface BrainClientConfig {
   baseUrl: string;
@@ -22,7 +73,10 @@ export class BrainClient {
   constructor(config: BrainClientConfig) {
     this.baseUrl = config.baseUrl.replace(/\/$/, '');
     this.apiKey = config.apiKey;
-    this.timeoutMs = config.timeoutMs ?? 30_000;
+    this.timeoutMs =
+      config.timeoutMs === undefined
+        ? DEFAULT_BRAIN_TIMEOUT_MS
+        : assertPositiveSafeIntegerMs(config.timeoutMs, 'BrainClient timeoutMs');
   }
 
   private async request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
@@ -75,10 +129,17 @@ export class BrainClient {
           endpoint,
         });
       }
+      const networkCode = getNetworkCauseCode(error);
+      const definitelyNotDispatched =
+        networkCode !== undefined && DEFINITELY_PRE_DISPATCH_CODES.has(networkCode);
       throw new AppError(
         'BRAIN_UNREACHABLE',
         error instanceof Error ? error.message : 'Brain unreachable',
-        { endpoint }
+        {
+          endpoint,
+          ...(networkCode ? { networkCode } : {}),
+          ...(definitelyNotDispatched ? { requestDisposition: 'not_dispatched' } : {}),
+        }
       );
     } finally {
       clearTimeout(timeoutId);
@@ -89,11 +150,17 @@ export class BrainClient {
     // Lets an idempotency-aware backend collapse retries of an ambiguous save
     // (timeout / lost response). Ignored by backends that do not support it.
     const key = entry.metadata?.contentHash;
-    return this.request<BrainEntry>('/api/brain/entries', {
+    const result = await this.request<unknown>('/api/brain/entries', {
       method: 'POST',
       headers: typeof key === 'string' ? { 'Idempotency-Key': key } : undefined,
       body: JSON.stringify(entry),
     });
+    if (!isBrainEntry(result)) {
+      throw new AppError('BRAIN_HTTP_ERROR', 'Brain returned an invalid BrainEntry response', {
+        endpoint: '/api/brain/entries',
+      });
+    }
+    return result;
   }
 
   async search(
@@ -150,7 +217,7 @@ export function getBrainClient(): BrainClient {
   if (!brainClient) {
     const baseUrl = process.env.BRAIN_API_URL || 'http://localhost:3001';
     const apiKey = process.env.BRAIN_API_KEY || undefined;
-    const timeoutMs = Number(process.env.BRAIN_TIMEOUT_MS) || 30_000;
+    const timeoutMs = parsePositiveSafeIntegerEnv('BRAIN_TIMEOUT_MS', DEFAULT_BRAIN_TIMEOUT_MS);
     brainClient = new BrainClient({ baseUrl, apiKey, timeoutMs });
   }
   return brainClient;

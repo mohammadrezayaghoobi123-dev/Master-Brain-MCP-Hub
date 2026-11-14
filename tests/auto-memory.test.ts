@@ -278,8 +278,8 @@ describe('AutoMemoryMiddleware reservation recovery', () => {
         session_id: 'save-recovery-session',
       })).resolves.toMatchObject({
         saved: false,
-        reason: 'duplicate_in_flight',
-        retryable: true,
+        reason: 'outcome_unknown',
+        retryable: false,
       });
 
       expect(analyze).toHaveBeenCalledTimes(1);
@@ -288,6 +288,25 @@ describe('AutoMemoryMiddleware reservation recovery', () => {
     } finally {
       mw.close();
       _resetBrainClientForTests();
+    }
+  });
+});
+
+describe('Auto-Memory UNKNOWN observability', () => {
+  it('exposes unknown claim count and oldest timestamp without exposing owner tokens', () => {
+    const dedup = memoryDedup();
+    const owner = dedup.claim('observability-hash', 5)!;
+    dedup.markUnknown('observability-hash', owner);
+    const mw = new AutoMemoryMiddleware({ enabled: true }, dedup);
+    try {
+      const status = mw.getStatus();
+      expect(status.unknownClaims.count).toBe(1);
+      expect(status.unknownClaims.oldestAt).toEqual(expect.any(Number));
+      expect(status.unknownClaims.oldestAt).toBeLessThanOrEqual(Date.now());
+      expect(status.effectiveLeaseMs).toBeGreaterThan(0);
+      expect(JSON.stringify(status)).not.toContain(owner);
+    } finally {
+      mw.close();
     }
   });
 });
@@ -414,11 +433,12 @@ describe('AutoMemoryMiddleware concurrent session limits', () => {
 
 
 describe('AutoMemoryMiddleware durable-save recovery', () => {
-  it('promotes its own claim through owner-aware recovery when commit throws after a durable save', async () => {
+  it('retains UNKNOWN when local commit fails after a confirmed durable save', async () => {
     const dedup = memoryDedup();
     const commit = vi.spyOn(dedup, 'commit').mockImplementation(() => {
       throw new Error('temporary dedup store failure');
     });
+    const add = vi.spyOn(dedup, 'add');
     vi.spyOn(console, 'error').mockImplementation(() => {});
     const mw = new AutoMemoryMiddleware(
       { enabled: true, minConfidence: 0.7, maxEntriesPerSession: 2 },
@@ -452,13 +472,89 @@ describe('AutoMemoryMiddleware durable-save recovery', () => {
         session_id: 'durable-save-session',
       })).resolves.toMatchObject({ saved: true });
 
+      const hash = contentHash('durable request\n---\ndurable response');
       expect(commit).toHaveBeenCalledTimes(1);
-      expect(dedup.status(contentHash('durable request\n---\ndurable response'))).toBe('committed');
+      expect(add).not.toHaveBeenCalled();
+      expect(dedup.status(hash)).toBe('unknown');
       expect(mw.getStatus().sessionCounts['durable-save-session']).toBe(1);
       await expect(mw.processInteraction('durable request', 'durable response', {
         tool: 'manual',
         session_id: 'durable-save-session',
-      })).resolves.toMatchObject({ saved: false, reason: 'duplicate' });
+      })).resolves.toMatchObject({ saved: false, reason: 'outcome_unknown', retryable: false });
+      expect(global.fetch).toHaveBeenCalledTimes(1);
+    } finally {
+      mw.close();
+      _resetBrainClientForTests();
+    }
+  });
+});
+
+describe('pre-dispatch transport recovery', () => {
+  const analysis = {
+    isImportant: true,
+    type: 'decision' as const,
+    summary: 'Retry after a proven pre-dispatch failure',
+    tags: ['pre-dispatch'],
+    confidence: 1,
+  };
+
+  it('releases UNKNOWN only for a transport error proving no connection was established', async () => {
+    const dedup = memoryDedup();
+    const mw = new AutoMemoryMiddleware({ enabled: true, minConfidence: 0.7 }, dedup);
+    vi.spyOn(mw as any, 'analyzeImportance').mockResolvedValue(analysis);
+    _resetBrainClientForTests();
+
+    const refused = Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' });
+    const fetchFailure = Object.assign(new TypeError('fetch failed'), { cause: refused });
+    global.fetch = vi.fn()
+      .mockRejectedValueOnce(fetchFailure)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 201,
+        json: async () => ({
+          id: 'entry-after-retry',
+          type: 'decision',
+          content: analysis.summary,
+          tags: analysis.tags,
+          timestamp: new Date().toISOString(),
+          source: { tool: 'manual' },
+        }),
+      }) as unknown as typeof fetch;
+
+    try {
+      await expect(mw.processInteraction('pre-dispatch req', 'res', { tool: 'manual' }))
+        .rejects.toMatchObject({
+          code: 'BRAIN_UNREACHABLE',
+          details: { networkCode: 'ECONNREFUSED', requestDisposition: 'not_dispatched' },
+        });
+      expect(dedup.status(contentHash('pre-dispatch req\n---\nres'))).toBeNull();
+
+      await expect(mw.processInteraction('pre-dispatch req', 'res', { tool: 'manual' }))
+        .resolves.toMatchObject({ saved: true });
+      expect(global.fetch).toHaveBeenCalledTimes(2);
+    } finally {
+      mw.close();
+      _resetBrainClientForTests();
+    }
+  });
+
+  it('does not reopen retry after ECONNRESET because dispatch may already have happened', async () => {
+    const dedup = memoryDedup();
+    const mw = new AutoMemoryMiddleware({ enabled: true, minConfidence: 0.7 }, dedup);
+    vi.spyOn(mw as any, 'analyzeImportance').mockResolvedValue(analysis);
+    _resetBrainClientForTests();
+
+    const reset = Object.assign(new Error('connection reset'), { code: 'ECONNRESET' });
+    global.fetch = vi.fn().mockRejectedValue(
+      Object.assign(new TypeError('fetch failed'), { cause: reset })
+    ) as unknown as typeof fetch;
+
+    try {
+      await expect(mw.processInteraction('ambiguous reset req', 'res', { tool: 'manual' }))
+        .rejects.toMatchObject({ code: 'BRAIN_UNREACHABLE' });
+      expect(dedup.status(contentHash('ambiguous reset req\n---\nres'))).toBe('unknown');
+      await expect(mw.processInteraction('ambiguous reset req', 'res', { tool: 'manual' }))
+        .resolves.toMatchObject({ reason: 'outcome_unknown', retryable: false });
       expect(global.fetch).toHaveBeenCalledTimes(1);
     } finally {
       mw.close();
