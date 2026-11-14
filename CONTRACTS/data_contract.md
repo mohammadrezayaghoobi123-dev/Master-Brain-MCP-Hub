@@ -87,7 +87,7 @@ A stale owner cannot commit, release, or revert another owner's row. A confirmed
 
 1. The Hub must persist `unknown` before dispatching the Brain POST. If that transition cannot be confirmed, it must not send the POST.
 2. Only positively identified pre-dispatch connection-establishment failures (`ECONNREFUSED`, `ENOTFOUND`, `EAI_AGAIN`) are eligible for owner-checked `unknown` reversion in the current implementation.
-3. Timeouts, connection resets, HTTP error responses, redirect failures, and malformed or unreadable success responses remain `unknown` because the Backend may have processed the write.
+3. Timeouts, connection resets, HTTP error responses, and malformed or unreadable success responses remain `unknown` because the Backend may have processed the write. **Known gap at PR5 HEAD:** Fetch still follows redirects by default for writes; a transport failure on a redirected second hop can be misclassified as pre-dispatch. PR #10 proposes `redirect: 'error'` for non-GET requests, but that fix is not yet part of PR5 HEAD.
 4. There is no operator reconciliation API in this version. An unresolved `unknown` can block the same content indefinitely. This is a deliberate safety-over-liveness policy, not a claim of exactly-once persistence.
 5. The Hub sends an `Idempotency-Key` header on Brain saves, but Backend support, key scope, retention, and replay semantics are **UNVERIFIED**. The header alone provides no idempotency guarantee.
 6. After the committed deduplication window expires, the same content hash may be saved again.
