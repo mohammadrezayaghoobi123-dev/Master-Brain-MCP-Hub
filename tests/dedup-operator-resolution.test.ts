@@ -261,6 +261,7 @@ describe('dedup-admin CLI', () => {
     const code = runCli(['resolve', hex(101).slice(0, 12), '--outcome', 'not_stored'], { store, io, now: Date.now() + 60 * MIN });
     expect(code).toBe(EXIT_CONFIRM);
     expect(store.status(hex(101))).toBe('unknown');
+    expect(out.join('\n')).toContain('exactly one UNKNOWN entry');
     expect(out.join('\n')).toContain('--yes');
   });
 
