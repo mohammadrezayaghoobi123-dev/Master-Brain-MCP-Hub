@@ -32,7 +32,7 @@ export interface ResolveUnknownOptions {
   outcome: UnknownOutcome;
   /** Operator identity recorded in the audit trail. */
   operator: string;
-  /** Refuse entries quarantined more recently than this, so an in-flight request is never resolved. */
+  /** Minimum age guard. This is only a delay, not proof that the external request completed. */
   minAgeMs: number;
   /** Retention of a `stored` outcome as a committed entry (minutes). Defaults to 30. */
   ttlMinutes?: number;
@@ -42,7 +42,7 @@ export interface ResolveUnknownOptions {
 
 export type ResolveUnknownResult =
   | { ok: true; hashPrefix: string; outcome: UnknownOutcome }
-  | { ok: false; reason: 'invalid_prefix' | 'not_found' | 'ambiguous' | 'too_recent' };
+  | { ok: false; reason: 'invalid_prefix' | 'not_found' | 'ambiguous' | 'too_recent' | 'missing_timestamp' };
 
 export interface ResolutionRecord {
   at: number;
@@ -207,7 +207,8 @@ class MemoryDedupStore implements DedupStore {
     if (matches.length > 1) return { ok: false, reason: 'ambiguous' };
     const [hash, entry] = matches[0];
     const now = options.now ?? Date.now();
-    if (entry.unknownSince !== null && now - entry.unknownSince < options.minAgeMs) {
+    if (entry.unknownSince === null) return { ok: false, reason: 'missing_timestamp' };
+    if (now - entry.unknownSince < options.minAgeMs) {
       return { ok: false, reason: 'too_recent' };
     }
     const expiresAt =
@@ -428,7 +429,8 @@ class SqliteDedupStore implements DedupStore {
       let result: ResolveUnknownResult;
       if (rows.length === 0) result = { ok: false, reason: 'not_found' };
       else if (rows.length > 1) result = { ok: false, reason: 'ambiguous' };
-      else if (rows[0].unknownSince !== null && now - rows[0].unknownSince < options.minAgeMs) {
+      else if (rows[0].unknownSince === null) result = { ok: false, reason: 'missing_timestamp' };
+      else if (now - rows[0].unknownSince < options.minAgeMs) {
         result = { ok: false, reason: 'too_recent' };
       } else {
         const { hash } = rows[0];
