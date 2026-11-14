@@ -136,7 +136,7 @@ for (const backend of backends) {
       expect(store.listResolutions()).toHaveLength(0);
     });
 
-    it('refuses a recently quarantined entry (a request may still be in flight) until it is old enough', () => {
+    it('refuses a recently quarantined entry until the configured minimum age has elapsed', () => {
       quarantine(store, hex(50));
       const since = store.listUnknown()[0].unknownSince as number;
       const tooSoon = store.resolveUnknown(hex(50), {
@@ -256,7 +256,7 @@ describe('dedup-admin CLI', () => {
     expect(out.join('\n')).not.toContain(hex(100));
   });
 
-  it('resolve is a dry run without --yes and changes nothing', () => {
+  it('resolve dry run does not report a truncated-prefix candidate count and changes nothing', () => {
     quarantine(store, hex(101));
     const code = runCli(['resolve', hex(101).slice(0, 12), '--outcome', 'not_stored'], { store, io, now: Date.now() + 60 * MIN });
     expect(code).toBe(EXIT_CONFIRM);
@@ -278,13 +278,15 @@ describe('dedup-admin CLI', () => {
     expect(out.join('\n')).toContain('absent in backend');
   });
 
-  it('refuses a recent entry unless the age guard is lowered deliberately', () => {
+  it('refuses attempts to lower the operator age guard', () => {
     quarantine(store, hex(103));
     const args = ['resolve', hex(103).slice(0, 12), '--outcome', 'not_stored', '--yes'];
     expect(runCli(args, { store, io })).toBe(EXIT_REFUSED);
     expect(err.join('\n')).toContain('less than 10 minutes');
     expect(store.status(hex(103))).toBe('unknown');
-    expect(runCli([...args, '--min-age-minutes', '0.0001'], { store, io, now: Date.now() + MIN })).toBe(EXIT_OK);
+    expect(runCli([...args, '--min-age-minutes', '0.0001'], { store, io, now: Date.now() + MIN })).toBe(EXIT_USAGE);
+    expect(err.join('\\n')).toContain('cannot be lowered');
+    expect(store.status(hex(103))).toBe('unknown');
   });
 
   it.each([
