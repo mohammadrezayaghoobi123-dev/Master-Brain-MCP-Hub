@@ -48,7 +48,7 @@ const analysis = {
   confidence: 1,
 };
 const savedEntry = {
-  id: 'e1',
+  id: '123e4567-e89b-42d3-a456-426614174000',
   type: 'decision',
   content: analysis.summary,
   tags: analysis.tags,
@@ -248,6 +248,19 @@ describe.each([
 });
 
 describe('SQLite two-phase persistence', () => {
+  it('status treats an expired row as absent without running a global purge write', () => {
+    const store = createDedupStore(dbPath);
+    try {
+      expect(store.claim('expired-status', 1)).toEqual(expect.any(String));
+      advance(MIN + 1);
+      expect(store.status('expired-status')).toBeNull();
+      // The row remains available for the scheduled purge; status itself is read-only.
+      expect(store.purgeExpired()).toBe(1);
+    } finally {
+      store.close();
+    }
+  });
+
   it('pending, unknown, and committed entries survive a restart (reopen)', () => {
     const a = createDedupStore(dbPath);
     a.claim('pending-hash', 5);

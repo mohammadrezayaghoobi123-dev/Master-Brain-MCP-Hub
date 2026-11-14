@@ -95,7 +95,7 @@ describe('AutoMemoryMiddleware concurrent deduplication', () => {
       ok: true,
       status: 201,
       json: async () => ({
-        id: 'entry-1',
+        id: '123e4567-e89b-42d3-a456-426614174000',
         type: 'decision',
         content: 'A durable decision',
         tags: ['decision'],
@@ -155,7 +155,7 @@ describe('AutoMemoryMiddleware concurrent session limits', () => {
       ok: true,
       status: 201,
       json: async () => ({
-        id: 'entry-1',
+        id: '123e4567-e89b-42d3-a456-426614174000',
         type: 'decision',
         content: 'One allowed session entry',
         tags: ['test'],
@@ -211,7 +211,7 @@ describe('AutoMemoryMiddleware reservation recovery', () => {
       ok: true,
       status: 201,
       json: async () => ({
-        id: 'entry-retry',
+        id: '123e4567-e89b-42d3-a456-426614174000',
         type: 'decision',
         content: analysis.summary,
         tags: analysis.tags,
@@ -258,7 +258,7 @@ describe('AutoMemoryMiddleware reservation recovery', () => {
         ok: true,
         status: 201,
         json: async () => ({
-          id: 'entry-retry',
+          id: '123e4567-e89b-42d3-a456-426614174000',
           type: 'decision',
           content: analysis.summary,
           tags: analysis.tags,
@@ -395,7 +395,7 @@ describe('AutoMemoryMiddleware concurrent session limits', () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       json: async () => ({
-        id: 'entry-1',
+        id: '123e4567-e89b-42d3-a456-426614174000',
         type: 'decision',
         content: 'A durable decision',
         tags: ['test'],
@@ -457,7 +457,7 @@ describe('AutoMemoryMiddleware durable-save recovery', () => {
       ok: true,
       status: 201,
       json: async () => ({
-        id: 'entry-durable',
+        id: '123e4567-e89b-42d3-a456-426614174000',
         type: 'decision',
         content: analysis.summary,
         tags: analysis.tags,
@@ -512,7 +512,7 @@ describe('pre-dispatch transport recovery', () => {
         ok: true,
         status: 201,
         json: async () => ({
-          id: 'entry-after-retry',
+          id: '123e4567-e89b-42d3-a456-426614174000',
           type: 'decision',
           content: analysis.summary,
           tags: analysis.tags,
