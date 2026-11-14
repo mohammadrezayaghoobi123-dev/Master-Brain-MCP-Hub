@@ -71,3 +71,15 @@ The earlier follow-up audit's initial port-1 probe was invalid as proof of ECONN
 - PR #5: remains not approved for merge while its other open findings and independent-review disposition remain unresolved.
 
 No merge, deployment, Runtime write, force-push, or branch deletion was performed.
+
+
+## 8. Post-review verification addendum
+
+After the initial review:
+- The PR description was corrected to state that PR5-F2 is only partially verified; it no longer claims full closure.
+- The PR title was narrowed to PR5-F1 and the real-socket ECONNREFUSED coverage.
+- The historical port-1 probe correction was committed to the PR #5 follow-up report.
+- The final branch head at this addendum is `ec7637dfcf7d9438b77edaf607d9f91c50eb03c0`.
+- Exact-head CI run `43562172251` completed successfully: Node 22, 24, and 26 typecheck/test/build jobs and npm audit all passed; each Node job ran 183 tests across 7 files.
+
+The initial procedural conditions in section 7 for accurate PR wording and exact-head CI have therefore been met. This does **not** upgrade PR5-F2 beyond PARTIALLY VERIFIED, establish ENOTFOUND/EAI_AGAIN behavior, or verify the Backend/runtime contract. PR #10 remains Draft and unmerged. This independent review does not authorize merging PR #10 into PR #5 or PR #5 into its base.
