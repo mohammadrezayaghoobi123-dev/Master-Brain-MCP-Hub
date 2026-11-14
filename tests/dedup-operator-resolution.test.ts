@@ -286,7 +286,7 @@ describe('dedup-admin CLI', () => {
     expect(err.join('\n')).toContain('less than 10 minutes');
     expect(store.status(hex(103))).toBe('unknown');
     expect(runCli([...args, '--min-age-minutes', '0.0001'], { store, io, now: Date.now() + MIN })).toBe(EXIT_USAGE);
-    expect(err.join('\\n')).toContain('cannot be lowered');
+    expect(err.join('\n')).toContain('cannot be lowered');
     expect(store.status(hex(103))).toBe('unknown');
   });
 
