@@ -6,6 +6,9 @@ import type { AddressInfo } from 'node:net';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
 import { createDedupStore, createMemoryDedupStore, type DedupStore } from '../src/lib/dedup-store.js';
 import { runCli, EXIT_CONFIRM, EXIT_OK, EXIT_REFUSED, EXIT_USAGE } from '../src/cli/dedup-admin.js';
 import { AutoMemoryMiddleware } from '../src/middleware/auto-memory.js';
@@ -229,6 +232,38 @@ describe('operator resolution — SQLite durability', () => {
       expect(again.unknownStats().count).toBe(1);
     } finally {
       again.close();
+    }
+  });
+
+  it('fails closed when a SQLite UNKNOWN row has no quarantine timestamp', () => {
+    const path = join(dir, 'dedup.sqlite');
+    const first = createDedupStore(path, { requireSqlite: true });
+    quarantine(first, hex(93));
+    first.close();
+
+    // Simulate a damaged/legacy row. The production schema intentionally allows NULL here.
+    const Database = require('better-sqlite3') as new (filename: string) => {
+      prepare(sql: string): { run(...params: unknown[]): unknown };
+      close(): void;
+    };
+    const raw = new Database(path);
+    try {
+      raw.prepare('UPDATE content_hashes SET unknown_since = NULL WHERE hash = ?').run(hex(93));
+    } finally {
+      raw.close();
+    }
+
+    const reopened = createDedupStore(path, { requireSqlite: true });
+    try {
+      expect(reopened.resolveUnknown(hex(93), {
+        outcome: 'not_stored',
+        operator: 'ops',
+        minAgeMs: 0,
+      })).toEqual({ ok: false, reason: 'missing_timestamp' });
+      expect(reopened.status(hex(93))).toBe('unknown');
+      expect(reopened.listResolutions()).toEqual([]);
+    } finally {
+      reopened.close();
     }
   });
 });
