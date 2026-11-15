@@ -7,7 +7,7 @@
 //   npm run dedup:admin -- list
 //   npm run dedup:admin -- resolve <hash-prefix> --outcome not_stored|stored [--yes]
 //   npm run dedup:admin -- audit [--limit N]
-import { existsSync, realpathSync } from 'node:fs';
+import { realpathSync, statSync } from 'node:fs';
 import { userInfo } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { DEFAULT_BRAIN_TIMEOUT_MS, parsePositiveSafeIntegerEnv } from '../lib/time-budget.js';
@@ -51,6 +51,15 @@ export function minResolveAgeMs(): number {
 }
 
 /** True when this module is the process entrypoint, also through npm/.bin symlinks. */
+function isNonEmptyFile(path: string): boolean {
+  try {
+    const st = statSync(path);
+    return st.isFile() && st.size > 0;
+  } catch {
+    return false;
+  }
+}
+
 export function isEntrypoint(metaUrl: string, argv1: string | undefined): boolean {
   if (argv1 === undefined) return false;
   try {
@@ -65,6 +74,7 @@ const USAGE = [
   '  dedup-admin list',
   '  dedup-admin resolve <hash-prefix> --outcome not_stored|stored [--note TEXT]',
   `                      [--ttl-minutes N (REQUIRED for stored; must equal the Hub's dedup window, e.g. ${DEFAULT_RESOLVE_TTL_MINUTES})] [--yes]`,
+  `                      [--acknowledge-legacy-budget (entries from older Hubs; BRAIN_TIMEOUT_MS here must equal the Hub's)]`,
   '  dedup-admin audit [--limit N]',
 ].join('\n');
 
@@ -88,7 +98,7 @@ function parseFlags(args: string[]): { positional: string[]; flags: Map<string, 
     }
     const name = arg.slice(2);
     const next = args[i + 1];
-    if (name === 'yes' || next === undefined || next.startsWith('--')) {
+    if (name === 'yes' || name === 'acknowledge-legacy-budget' || next === undefined || next.startsWith('--')) {
       flags.set(name, true);
     } else {
       flags.set(name, next);
@@ -125,9 +135,9 @@ export function runCli(argv: string[], options: CliOptions = {}): number {
   try {
     if (!store) {
       const location = locateDedupDb();
-      if (!existsSync(location.path)) {
+      if (!isNonEmptyFile(location.path)) {
         io.err(
-          `No dedup database at ${location.path}. Refusing to create one: set DEDUP_DB_PATH (or DATA_DIR) to the Hub's database.`
+          `No dedup database (a non-empty file) at ${location.path}. Refusing to create one: set DEDUP_DB_PATH (or DATA_DIR) to the Hub's database.`
         );
         return EXIT_REFUSED;
       }
@@ -186,11 +196,16 @@ export function runCli(argv: string[], options: CliOptions = {}): number {
     }
     const note = typeof flags.get('note') === 'string' ? (flags.get('note') as string) : undefined;
 
+    const acknowledgeLegacy = flags.get('acknowledge-legacy-budget') === true;
+    const LEGACY_WARNING =
+      'This entry has no recorded in-flight budget (written by an older Hub). The age floor uses THIS shell\'s BRAIN_TIMEOUT_MS; it must equal the value the Hub ran with. Re-run with --acknowledge-legacy-budget once you have verified that.';
+
     if (flags.get('yes') !== true) {
       const preview = store.inspectUnknown(prefix, { minAgeMs: minResolveAgeMs(), now });
       io.out('Dry run only: no state changed.');
       if (preview.ok) {
         io.out(`Matched ${preview.hashPrefix}, quarantined ${age(preview.unknownSince, now)} ago; eligible for resolution.`);
+        if (!preview.budgetKnown) io.out(`WARNING: ${LEGACY_WARNING}`);
       } else {
         io.out(`This would be REFUSED: ${REFUSAL_TEXT[preview.reason]}`);
       }
@@ -201,6 +216,14 @@ export function runCli(argv: string[], options: CliOptions = {}): number {
       );
       io.out('Re-run with --yes to apply.');
       return EXIT_CONFIRM;
+    }
+
+    if (!acknowledgeLegacy) {
+      const pre = store.inspectUnknown(prefix, { minAgeMs: minResolveAgeMs(), now });
+      if (pre.ok && !pre.budgetKnown) {
+        io.err(`Refused: ${LEGACY_WARNING}`);
+        return EXIT_REFUSED;
+      }
     }
 
     const operator = options.operator ?? userInfo().username;

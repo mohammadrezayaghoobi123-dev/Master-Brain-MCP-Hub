@@ -3,7 +3,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
@@ -304,7 +304,7 @@ describe('dedup-admin CLI', () => {
   it('resolve --yes applies, records the operator and the note, and audit prints it', () => {
     quarantine(store, hex(102));
     const code = runCli(
-      ['resolve', hex(102).slice(0, 12), '--outcome', 'not_stored', '--yes', '--note', 'absent in backend'],
+      ['resolve', hex(102).slice(0, 12), '--outcome', 'not_stored', '--yes', '--acknowledge-legacy-budget', '--note', 'absent in backend'],
       { store, io, operator: 'dana', now: Date.now() + 60 * MIN }
     );
     expect(code).toBe(EXIT_OK);
@@ -317,7 +317,7 @@ describe('dedup-admin CLI', () => {
 
   it('refuses attempts to lower the operator age guard', () => {
     quarantine(store, hex(103));
-    const args = ['resolve', hex(103).slice(0, 12), '--outcome', 'not_stored', '--yes'];
+    const args = ['resolve', hex(103).slice(0, 12), '--outcome', 'not_stored', '--yes', '--acknowledge-legacy-budget'];
     expect(runCli(args, { store, io })).toBe(EXIT_REFUSED);
     expect(err.join('\n')).toContain('too recently');
     expect(store.status(hex(103))).toBe('unknown');
@@ -473,7 +473,7 @@ describe('P11 review findings', () => {
         quarantine(store, hex(203));
         store.resolveUnknown(hex(203), {
           outcome: 'not_stored',
-          operator: 'ev\u202eil\u0085ops\u2028x',
+          operator: 'ev\u202eil\u0085ops\u2028x\u061c\ufeff\u200cz',
           minAgeMs: 0,
           note: 'a\u2066b\u200ec\u009fd',
         });
@@ -481,6 +481,8 @@ describe('P11 review findings', () => {
         for (const field of [record.operator, record.note ?? '']) {
           expect(/[\u0085\u009f\u2028\u200e\u202e\u2066]/.test(field)).toBe(false);
         }
+        expect(/[\u061c\ufeff]/.test(record.operator)).toBe(false);
+        expect(record.operator).toContain('\u200cz'); // ZWNJ is legitimate Persian text
         expect(record.operator).toContain('ops');
         expect(record.note).toContain('d');
       } finally {
@@ -496,7 +498,7 @@ describe('P11 review findings', () => {
     expect(minResolveAgeMs()).toBe(60 * MIN + 1000);
   });
 
-  it('P11-1: the middleware persists a budget of at least twice BRAIN_TIMEOUT_MS when it quarantines', async () => {
+  it('P11-1: the middleware persists exactly 2 x BRAIN_TIMEOUT_MS + 1s when it quarantines', async () => {
     process.env.BRAIN_TIMEOUT_MS = '5000';
     const dedup = createMemoryDedupStore();
     const spy = vi.spyOn(dedup, 'markUnknown');
@@ -505,10 +507,11 @@ describe('P11 review findings', () => {
       isImportant: true, type: 'decision', summary: 's', tags: [], confidence: 0.95,
     });
     vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    vi.spyOn(globalThis, 'fetch').mockRejectedValue(new TypeError('network down'));
     try {
       await middleware.processInteraction('budget-req', 'budget-res', { tool: 'api' }).catch(() => undefined);
       expect(spy).toHaveBeenCalled();
-      expect((spy.mock.calls[0][2] ?? 0) >= 2 * 5000).toBe(true);
+      expect(spy.mock.calls[0][2]).toBe(2 * 5000 + 1000);
     } finally {
       middleware.close();
       vi.restoreAllMocks();
@@ -521,7 +524,7 @@ describe('P11 review findings', () => {
     const io = { out: () => undefined, err: (l: string) => err.push(l) };
     try {
       quarantine(store, hex(204));
-      const base = ['resolve', hex(204).slice(0, 12), '--outcome', 'stored', '--yes'];
+      const base = ['resolve', hex(204).slice(0, 12), '--outcome', 'stored', '--yes', '--acknowledge-legacy-budget'];
       expect(runCli(base, { store, io, now: Date.now() + 60 * MIN })).toBe(EXIT_USAGE);
       expect(err.join('\n')).toContain('--ttl-minutes is required');
       expect(store.status(hex(204))).toBe('unknown');
@@ -557,7 +560,7 @@ describe('P11 review findings', () => {
     expect(runCli(['list'], { io, now: later })).toBe(EXIT_OK);
     expect(out.join('\n')).toContain(path);
     expect(out.join('\n')).toContain(hex(205).slice(0, 12));
-    expect(runCli(['resolve', hex(205).slice(0, 12), '--outcome', 'not_stored', '--yes', '--note', 'checked'], { io, now: later, operator: 'dana' })).toBe(EXIT_OK);
+    expect(runCli(['resolve', hex(205).slice(0, 12), '--outcome', 'not_stored', '--yes', '--acknowledge-legacy-budget', '--note', 'checked'], { io, now: later, operator: 'dana' })).toBe(EXIT_OK);
     const check = createDedupStore(path, { requireSqlite: true });
     try {
       expect(check.status(hex(205))).toBeNull();
@@ -614,4 +617,102 @@ describe('P11 review findings', () => {
     expect(isEntrypoint(metaUrl, join(dir, 'other.js'))).toBe(false);
     expect(isEntrypoint(metaUrl, undefined)).toBe(false);
   });
+
+  for (const backend of backends) {
+    it(`[${backend.name}] R20: an invalid in-flight budget is rejected instead of silently looking like a legacy row`, () => {
+      const dir = tmp();
+      const store = backend.open(dir);
+      try {
+        const token = store.claim(hex(210), 5) as string;
+        for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER]) {
+          expect(() => store.markUnknown(hex(210), token, bad)).toThrow();
+        }
+        expect(store.status(hex(210))).toBe('pending');
+      } finally {
+        store.close();
+      }
+    });
+  }
+
+  it('R20-4: the CLI resolve floor follows BRAIN_TIMEOUT_MS (a mutation to the fixed 10 minutes would fail this)', () => {
+    process.env.BRAIN_TIMEOUT_MS = String(30 * MIN);
+    const store = createMemoryDedupStore();
+    const err: string[] = [];
+    const io = { out: () => undefined, err: (l: string) => err.push(l) };
+    try {
+      quarantine(store, hex(211));
+      const t0 = Date.now();
+      const args = ['resolve', hex(211).slice(0, 12), '--outcome', 'not_stored', '--yes', '--acknowledge-legacy-budget'];
+      expect(runCli(args, { store, io, now: t0 + 20 * MIN })).toBe(EXIT_REFUSED); // > 10 min, < 2 x 30 min + 1s
+      expect(store.status(hex(211))).toBe('unknown');
+      expect(runCli(args, { store, io, now: t0 + 62 * MIN })).toBe(EXIT_OK);
+    } finally {
+      store.close();
+    }
+  });
+
+  it('R20-2/R20-4: a legacy SQLite row (3-column schema, no budget) is migrated, flagged, and needs explicit acknowledgement', () => {
+    const dir = tmp();
+    const path = join(dir, 'dedup.sqlite');
+    const Database = require('better-sqlite3');
+    const old = new Database(path);
+    old.exec(
+      "CREATE TABLE content_hashes (hash TEXT PRIMARY KEY, expires_at INTEGER NOT NULL, state TEXT NOT NULL DEFAULT 'committed', owner TEXT, unknown_since INTEGER)"
+    );
+    old.prepare("INSERT INTO content_hashes(hash, expires_at, state, owner, unknown_since) VALUES(?, ?, 'unknown', 'o', ?)").run(
+      hex(212),
+      Number.MAX_SAFE_INTEGER,
+      Date.now() - 2 * 60 * MIN
+    );
+    old.close();
+    process.env.DEDUP_DB_PATH = path;
+    const out: string[] = [];
+    const err: string[] = [];
+    const io = { out: (l: string) => out.push(l), err: (l: string) => err.push(l) };
+    const prefix = hex(212).slice(0, 12);
+    expect(runCli(['resolve', prefix, '--outcome', 'not_stored'], { io })).toBe(EXIT_CONFIRM);
+    expect(out.join('\n')).toContain('WARNING');
+    expect(runCli(['resolve', prefix, '--outcome', 'not_stored', '--yes'], { io })).toBe(EXIT_REFUSED);
+    expect(err.join('\n')).toContain('older Hub');
+    const check = new Database(path);
+    try {
+      expect(check.prepare('PRAGMA table_info(content_hashes)').all().map((c: { name: string }) => c.name)).toContain('resolve_not_before');
+      expect(check.prepare('SELECT state FROM content_hashes WHERE hash = ?').get(hex(212))).toMatchObject({ state: 'unknown' });
+    } finally {
+      check.close();
+    }
+    expect(runCli(['resolve', prefix, '--outcome', 'not_stored', '--yes', '--acknowledge-legacy-budget'], { io, operator: 'dana' })).toBe(EXIT_OK);
+  });
+
+  it('R20-5: committing an UNKNOWN entry clears its stored in-flight budget (SQLite)', () => {
+    const dir = tmp();
+    const path = join(dir, 'dedup.sqlite');
+    const store = createDedupStore(path, { requireSqlite: true });
+    const Database = require('better-sqlite3');
+    try {
+      const token = store.claim(hex(213), 5) as string;
+      store.markUnknown(hex(213), token, 60_000);
+      const peek = new Database(path);
+      expect(peek.prepare('SELECT resolve_not_before AS r FROM content_hashes WHERE hash = ?').get(hex(213)).r).not.toBeNull();
+      expect(store.commit(hex(213), token, 30)).toBe(true);
+      expect(peek.prepare('SELECT resolve_not_before AS r FROM content_hashes WHERE hash = ?').get(hex(213)).r).toBeNull();
+      peek.close();
+    } finally {
+      store.close();
+    }
+  });
+
+  it('R20-3: the CLI refuses a zero-byte or directory database path and does not write into it', () => {
+    const dir = tmp();
+    const empty = join(dir, 'empty.sqlite');
+    writeFileSync(empty, '');
+    const err: string[] = [];
+    for (const target of [empty, dir]) {
+      process.env.DEDUP_DB_PATH = target;
+      expect(runCli(['list'], { io: { out: () => undefined, err: (l) => err.push(l) } })).toBe(EXIT_REFUSED);
+    }
+    expect(err.length).toBe(2);
+    expect(statSync(empty).size).toBe(0);
+  });
 });
+

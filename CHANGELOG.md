@@ -2,6 +2,11 @@
 
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## Unreleased
+
+### Fixed
+- Operator resolution of UNKNOWN entries (review findings P11-1..P11-7, R20-1..R20-6): per-entry in-flight budget (`resolve_not_before`) and an age floor derived from `BRAIN_TIMEOUT_MS`; explicit `--ttl-minutes` for `stored`; DB path shown and missing DB never created; `--acknowledge-legacy-budget` for rows from older Hubs; realpath entrypoint detection; read-only dry-run preview; wider log/terminal-safe sanitiser.
+
 ## 1.1.0 — 2026-11-08
 
 Engineering hardening pass (atomic fixes against review findings).

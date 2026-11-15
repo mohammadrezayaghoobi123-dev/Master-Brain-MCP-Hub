@@ -46,7 +46,7 @@ export type ResolveUnknownResult =
 
 /** Read-only preview of what `resolveUnknown` would do; never changes state. */
 export type InspectUnknownResult =
-  | { ok: true; hashPrefix: string; unknownSince: number; eligibleAt: number }
+  | { ok: true; hashPrefix: string; unknownSince: number; eligibleAt: number; budgetKnown: boolean }
   | { ok: false; reason: 'invalid_prefix' | 'not_found' | 'ambiguous' | 'too_recent' | 'in_flight' | 'missing_timestamp' };
 
 export interface ResolutionRecord {
@@ -142,10 +142,11 @@ class MemoryDedupStore implements DedupStore {
     const e = this.live(hash);
     if (!e || e.state !== 'pending' || e.owner !== token) return false;
     const now = Date.now();
+    const resolveNotBefore = notBefore(now, inFlightBudgetMs); // may throw: validate before mutating
     e.state = 'unknown';
     e.exp = Number.POSITIVE_INFINITY;
     e.unknownSince = now;
-    e.resolveNotBefore = notBefore(now, inFlightBudgetMs);
+    e.resolveNotBefore = resolveNotBefore;
     return true;
   }
 
@@ -384,7 +385,8 @@ class SqliteDedupStore implements DedupStore {
            expires_at = excluded.expires_at,
            state = 'pending',
            owner = excluded.owner,
-           unknown_since = NULL
+           unknown_since = NULL,
+           resolve_not_before = NULL
          WHERE content_hashes.state != 'unknown'
            AND content_hashes.expires_at < ?`
       )
@@ -415,7 +417,7 @@ class SqliteDedupStore implements DedupStore {
     const expiresAt = expiresAtForTtl(ttlMinutes, now);
     const result = this.db
       .prepare(
-        `UPDATE content_hashes SET state = 'committed', owner = NULL, expires_at = ?, unknown_since = NULL
+        `UPDATE content_hashes SET state = 'committed', owner = NULL, expires_at = ?, unknown_since = NULL, resolve_not_before = NULL
          WHERE hash = ? AND owner = ?
            AND state = 'unknown'`
       )
@@ -440,7 +442,8 @@ class SqliteDedupStore implements DedupStore {
            expires_at = excluded.expires_at,
            state = 'committed',
            owner = NULL,
-           unknown_since = NULL
+           unknown_since = NULL,
+           resolve_not_before = NULL
          WHERE content_hashes.state != 'unknown'
            AND content_hashes.expires_at < ?`
       )
@@ -503,7 +506,7 @@ class SqliteDedupStore implements DedupStore {
             ? this.db.prepare("DELETE FROM content_hashes WHERE hash = ? AND state = 'unknown'").run(hash)
             : this.db
                 .prepare(
-                  `UPDATE content_hashes SET state = 'committed', owner = NULL, expires_at = ?, unknown_since = NULL
+                  `UPDATE content_hashes SET state = 'committed', owner = NULL, expires_at = ?, unknown_since = NULL, resolve_not_before = NULL
                    WHERE hash = ? AND state = 'unknown'`
                 )
                 .run(ttlExpiry, hash);
@@ -582,14 +585,17 @@ class SqliteDedupStore implements DedupStore {
 }
 
 /** C0/C1 controls, DEL, line/paragraph separators and bidi overrides (log, terminal and display spoofing). */
-const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g;
+const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f\u200e\u200f\u2028\u2029\u061c\u2060-\u2064\u202a-\u202e\u2066-\u2069\ufeff]/g;
 
 /** `resolveNotBefore` for an UNKNOWN row: when the request's own timeout budget has certainly elapsed. */
 function notBefore(now: number, inFlightBudgetMs: number | undefined): number | null {
   if (inFlightBudgetMs === undefined) return null;
-  if (!Number.isFinite(inFlightBudgetMs) || inFlightBudgetMs <= 0) return null;
   const at = now + inFlightBudgetMs;
-  return Number.isSafeInteger(at) ? at : null;
+  // A silent NULL would fail open (the entry would look like a legacy row), so reject bad budgets.
+  if (!Number.isFinite(inFlightBudgetMs) || inFlightBudgetMs <= 0 || !Number.isSafeInteger(at)) {
+    throw new RangeError('markUnknown: inFlightBudgetMs must be a positive finite number');
+  }
+  return at;
 }
 
 /** Why an operator may NOT resolve this row yet, or null when it is eligible. */
@@ -616,7 +622,13 @@ function inspectRow(
   if (blocked === 'missing_timestamp') return { ok: false, reason: blocked };
   const eligibleAt = Math.max((unknownSince as number) + options.minAgeMs, resolveNotBefore ?? 0);
   if (blocked) return { ok: false, reason: blocked };
-  return { ok: true, hashPrefix: hash.slice(0, 12), unknownSince: unknownSince as number, eligibleAt };
+  return {
+    ok: true,
+    hashPrefix: hash.slice(0, 12),
+    unknownSince: unknownSince as number,
+    eligibleAt,
+    budgetKnown: resolveNotBefore !== null,
+  };
 }
 
 function normalizePrefix(value: string): string | null {
