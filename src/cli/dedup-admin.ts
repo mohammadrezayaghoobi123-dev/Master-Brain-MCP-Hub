@@ -14,6 +14,7 @@ import { DEFAULT_BRAIN_TIMEOUT_MS, parsePositiveSafeIntegerEnv } from '../lib/ti
 import {
   createDedupStore,
   locateDedupDb,
+  sanitizeForDisplay,
   DEFAULT_RESOLVE_TTL_MINUTES,
   type DedupStore,
   type UnknownOutcome,
@@ -50,7 +51,6 @@ export function minResolveAgeMs(): number {
   return Math.max(DEFAULT_MIN_AGE_MINUTES * 60_000, timeoutMs * 2 + 1000);
 }
 
-/** True when this module is the process entrypoint, also through npm/.bin symlinks. */
 function isNonEmptyFile(path: string): boolean {
   try {
     const st = statSync(path);
@@ -60,6 +60,7 @@ function isNonEmptyFile(path: string): boolean {
   }
 }
 
+/** True when this module is the process entrypoint, also through npm/.bin symlinks. */
 export function isEntrypoint(metaUrl: string, argv1: string | undefined): boolean {
   if (argv1 === undefined) return false;
   try {
@@ -169,7 +170,7 @@ export function runCli(argv: string[], options: CliOptions = {}): number {
       const records = store.listResolutions(limit);
       if (records.length === 0) io.out('No resolutions recorded.');
       for (const r of records) {
-        io.out(`${new Date(r.at).toISOString()}  ${r.hashPrefix}  ${r.outcome}  by ${r.operator}${r.note ? `  — ${r.note}` : ''}`);
+        io.out(`${new Date(r.at).toISOString()}  ${r.hashPrefix}  ${r.outcome}  by ${sanitizeForDisplay(r.operator)}${r.note ? `  — ${sanitizeForDisplay(r.note)}` : ''}`);
       }
       return EXIT_OK;
     }
@@ -191,7 +192,7 @@ export function runCli(argv: string[], options: CliOptions = {}): number {
       return EXIT_USAGE;
     }
     if (flags.has('min-age-minutes')) {
-      io.err('--min-age-minutes is fixed at 10 minutes and cannot be lowered; elapsed time is not proof that a request completed');
+      io.err('--min-age-minutes cannot be lowered: the age floor is max(10 minutes, 2x BRAIN_TIMEOUT_MS + 1s); elapsed time is not proof that a request completed');
       return EXIT_USAGE;
     }
     const note = typeof flags.get('note') === 'string' ? (flags.get('note') as string) : undefined;
@@ -239,7 +240,7 @@ export function runCli(argv: string[], options: CliOptions = {}): number {
       io.err(`Refused: ${REFUSAL_TEXT[result.reason]}`);
       return EXIT_REFUSED;
     }
-    io.out(`Resolved ${result.hashPrefix} as ${result.outcome} (recorded for audit as ${operator}).`);
+    io.out(`Resolved ${result.hashPrefix} as ${result.outcome} (recorded for audit as ${sanitizeForDisplay(operator)}).`);
     return EXIT_OK;
   } finally {
     if (ownsStore && store) store.close();

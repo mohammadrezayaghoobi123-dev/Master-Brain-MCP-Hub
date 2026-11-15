@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
-import { createDedupStore, createMemoryDedupStore, type DedupStore } from '../src/lib/dedup-store.js';
+import { createDedupStore, createMemoryDedupStore, sanitizeForDisplay, type DedupStore } from '../src/lib/dedup-store.js';
 import { runCli, isEntrypoint, minResolveAgeMs, EXIT_CONFIRM, EXIT_OK, EXIT_REFUSED, EXIT_USAGE } from '../src/cli/dedup-admin.js';
 import { AutoMemoryMiddleware } from '../src/middleware/auto-memory.js';
 import { _resetBrainClientForTests } from '../src/brain/client.js';
@@ -716,3 +716,23 @@ describe('P11 review findings', () => {
   });
 });
 
+
+describe('R20 review nits (print-time sanitiser, age message)', () => {
+  it('sanitizeForDisplay strips invisible/format characters but keeps ZWNJ', () => {
+    const dirty = 'a\u200bb\u00adc\u202ed\u{e0041}e\u001b[31mf\ufffag\u200ch';
+    const out = sanitizeForDisplay(dirty);
+    expect(/[\u200b\u00ad\u202e\u001b\ufffa]/u.test(out)).toBe(false);
+    expect(/\u{e0041}/u.test(out)).toBe(false);
+    expect(out.includes('\u200c')).toBe(true);
+    expect(sanitizeForDisplay(undefined)).toBe('');
+  });
+
+  it('--min-age-minutes refusal names the real floor, not a fixed 10 minutes', () => {
+    const store = createMemoryDedupStore();
+    const err: string[] = [];
+    const io = { out: () => {}, err: (m: string) => { err.push(m); } };
+    const code = runCli(['resolve', hex(1), '--outcome', 'not_stored', '--min-age-minutes', '1', '--yes'], { store, io });
+    expect(code).toBe(EXIT_USAGE);
+    expect(err.join(' ').includes('2x BRAIN_TIMEOUT_MS')).toBe(true);
+  });
+});

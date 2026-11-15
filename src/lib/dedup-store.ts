@@ -585,7 +585,13 @@ class SqliteDedupStore implements DedupStore {
 }
 
 /** C0/C1 controls, DEL, line/paragraph separators and bidi overrides (log, terminal and display spoofing). */
-const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f\u200e\u200f\u2028\u2029\u061c\u2060-\u2064\u202a-\u202e\u2066-\u2069\ufeff]/g;
+// ZWNJ (U+200C) is deliberately kept: it is legitimate in Persian text.
+const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f\u00ad\u180e\u200b\u200e\u200f\u2028\u2029\u061c\u2060-\u2064\u202a-\u202e\u2066-\u2069\ufeff\ufff9-\ufffb\u{e0000}-\u{e007f}]/gu;
+
+/** Print-time sanitiser: rows written by older binaries or directly into the file may hold control characters. */
+export function sanitizeForDisplay(value: unknown): string {
+  return String(value ?? '').replace(CONTROL_CHARS, ' ');
+}
 
 /** `resolveNotBefore` for an UNKNOWN row: when the request's own timeout budget has certainly elapsed. */
 function notBefore(now: number, inFlightBudgetMs: number | undefined): number | null {
