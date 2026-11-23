@@ -87,7 +87,7 @@ The database path is configured explicitly (production requires a persistent SQL
 
 ### Owner-checked transitions
 
-- **`pending → unknown`**: only `markUnknown(hash, owner, inFlightBudgetMs?)` may perform this transition, and only while that owner's lease remains valid. The current production middleware supplies the per-entry in-flight budget before dispatching the external Brain write; older mixed-version writers may omit it and therefore create a legacy NULL-budget row.
+- **`pending → unknown`**: only `markUnknown(hash, owner, inFlightBudgetMs?)` may perform this transition, and only while that owner's lease remains valid. The current middleware implementation supplies the per-entry in-flight budget before dispatching the external Brain write; older mixed-version writers may omit it and therefore create a legacy NULL-budget row.
 - **`pending → absent`**: `release(hash, owner)` deletes only the matching owner's PENDING row.
 - **`unknown → absent`**: `revertUnknown(hash, owner)` is allowed only for the matching owner when the request is positively known to have **not** been dispatched. This is not a general retry mechanism.
 - **`unknown → committed`**: `commit(hash, owner, ttl)` updates only the matching owner's UNKNOWN row. A stale owner cannot commit or overwrite another owner's reservation.
@@ -101,7 +101,7 @@ The operator CLI supports listing quarantined rows, resolving one uniquely ident
 - Resolution is guarded by both the minimum-age rule and, for rows with a recorded budget, the per-entry `resolve_not_before` deadline. The CLI minimum age is `max(10 minutes, 2 × BRAIN_TIMEOUT_MS + 1 second)`. A row is refused while its per-entry deadline has not elapsed (`in_flight`), even if the minimum-age rule is already satisfied.
 - These deadlines are delays, **not proof** that an in-flight request completed. The backend may continue processing after the client aborts or crashes. The operator must establish the external outcome out of band before selecting either outcome.
 - For legacy UNKNOWN rows with no recorded per-entry budget, the dry run warns that the budget is unknown. Applying a resolution requires explicit `--acknowledge-legacy-budget`; the operator must verify that the CLI's `BRAIN_TIMEOUT_MS` matches the value used by the Hub that wrote the row.
-- Resolving as `stored` requires an explicit `--ttl-minutes` value equal to the Hub's configured deduplication window. An incorrect value can shorten or extend duplicate protection.
+- Resolving as `stored` requires an explicit positive `--ttl-minutes` value. The CLI checks that the value is present and positive, but does not compare it with the running Hub's configured deduplication window; the operator must verify and supply the matching value out of band. An incorrect value can shorten or extend duplicate protection.
 - The CLI prints the database path it uses, requires SQLite, and refuses to create a missing, empty, or directory database path. Opening an existing database may apply additive schema migrations.
 - A dry run (without `--yes`) previews the uniquely matched row and its eligibility without changing state. The actual resolution rechecks eligibility inside the store's transaction.
 
