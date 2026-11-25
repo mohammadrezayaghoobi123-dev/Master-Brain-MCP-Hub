@@ -12,7 +12,7 @@ describe('brain_save tag input boundary', () => {
     [],
     [''],
     ['   '],
-    ['\\t\\n'],
+    ['\t\n'],
   ])('rejects tag arrays containing only blank values: %j', (tags) => {
     expect(saveSchema.safeParse({ ...validBase, tags }).success).toBe(false);
   });
