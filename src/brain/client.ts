@@ -40,10 +40,16 @@ function getNetworkCauseCode(error: unknown): string | undefined {
 /** The API contract requires a complete BrainEntry before a save is treated as confirmed. */
 function isBrainEntry(value: unknown): value is BrainEntry {
   if (!isRecord(value)) return false;
-  if (typeof value.id !== 'string' || value.id.trim().length === 0) return false;
+  // Match the documented BrainEntry domain constraints before treating a POST as confirmed.
+  if (typeof value.id !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value.id)) return false;
   if (typeof value.type !== 'string' || !MEMORY_TYPES.includes(value.type as MemoryType)) return false;
-  if (typeof value.content !== 'string') return false;
-  if (!Array.isArray(value.tags) || !value.tags.every((tag) => typeof tag === 'string')) return false;
+  if (typeof value.content !== 'string' || value.content.length > 10_000) return false;
+  if (
+    !Array.isArray(value.tags) ||
+    value.tags.length < 1 ||
+    value.tags.length > 10 ||
+    !value.tags.every((tag) => typeof tag === 'string' && tag.trim().length > 0)
+  ) return false;
   if (!isRecord(value.source) || typeof value.source.tool !== 'string') return false;
   if (!MEMORY_SOURCE_TOOLS.has(value.source.tool)) return false;
 
@@ -54,7 +60,7 @@ function isBrainEntry(value: unknown): value is BrainEntry {
   if (typeof value.timestamp !== 'string') return false;
   if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value.timestamp)) return false;
   if (!Number.isFinite(Date.parse(value.timestamp))) return false;
-  if (value.summary !== undefined && typeof value.summary !== 'string') return false;
+  if (value.summary !== undefined && (typeof value.summary !== 'string' || value.summary.length > 200)) return false;
   if (value.metadata !== undefined && !isRecord(value.metadata)) return false;
   return true;
 }
@@ -96,8 +102,8 @@ export class BrainClient {
     try {
       // A followed redirect would let a transport error on the *redirect target*
       // (ECONNREFUSED/ENOTFOUND) be misread as "the request was never dispatched"
-      // although the first hop already received the body. Non-GET requests therefore
-      // never follow redirects; a 3xx surfaces as an ambiguous failure.
+      // although the first hop already received the body. Non-GET requests
+      // therefore never follow redirects; a 3xx surfaces as an ambiguous failure.
       const isReadOnly = (options.method ?? 'GET').toUpperCase() === 'GET';
       const response = await fetch(url, {
         ...options,
@@ -106,7 +112,16 @@ export class BrainClient {
         signal: controller.signal,
       });
 
-      if (!response.ok) {
+      // POST /entries is contractually successful only for 200 or 201.
+      // A generic Fetch response.ok check also accepts 202 (accepted, not
+      // necessarily persisted) and 204 (no representation to validate).
+      const method = (options.method ?? 'GET').toUpperCase();
+      const acceptedStatus =
+        method === 'POST'
+          ? response.status === 200 || response.status === 201
+          : response.ok;
+
+      if (!acceptedStatus) {
         let body: Record<string, unknown> = {};
         try {
           body = (await response.json()) as Record<string, unknown>;

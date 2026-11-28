@@ -337,23 +337,36 @@ class SqliteDedupStore implements DedupStore {
   }
 
   status(hash: string): DedupState | null {
-    this.purgeExpired();
-    const row = this.db.prepare('SELECT state FROM content_hashes WHERE hash = ?').get(hash) as
-      | { state: DedupState }
-      | undefined;
-    return row ? row.state : null;
+    // Status is a read path: do not run a global DELETE here. In particular,
+    // a read following a contended claim must not acquire another write lock.
+    const row = this.db
+      .prepare('SELECT state, expires_at AS expiresAt FROM content_hashes WHERE hash = ?')
+      .get(hash) as { state: DedupState; expiresAt: number } | undefined;
+    if (!row) return null;
+    if (row.state !== 'unknown' && row.expiresAt < Date.now()) return null;
+    return row.state;
   }
 
   claim(hash: string, leaseMinutes: number): string | null {
     assertValidLease(leaseMinutes);
-    this.purgeExpired();
+    const now = Date.now();
     const owner = randomUUID();
+    // One atomic statement replaces an expired row for this hash or inserts a
+    // new reservation. Avoid a separate global purge DELETE before the claim:
+    // concurrent processes otherwise contend on two writes and can raise SQLITE_BUSY.
     const result = this.db
       .prepare(
-        `INSERT OR IGNORE INTO content_hashes(hash, expires_at, state, owner)
-         VALUES(?, ?, 'pending', ?)`
+        `INSERT INTO content_hashes(hash, expires_at, state, owner, unknown_since)
+         VALUES(?, ?, 'pending', ?, NULL)
+         ON CONFLICT(hash) DO UPDATE SET
+           expires_at = excluded.expires_at,
+           state = 'pending',
+           owner = excluded.owner,
+           unknown_since = NULL
+         WHERE content_hashes.state != 'unknown'
+           AND content_hashes.expires_at < ?`
       )
-      .run(hash, Date.now() + leaseMinutes * 60_000, owner);
+      .run(hash, now + leaseMinutes * 60_000, owner, now);
     return result.changes === 1 ? owner : null;
   }
 
@@ -397,12 +410,19 @@ class SqliteDedupStore implements DedupStore {
   add(hash: string, ttlMinutes: number): void {
     const now = Date.now();
     const expiresAt = expiresAtForTtl(ttlMinutes, now);
-    this.purgeExpired();
     this.db
       .prepare(
-        "INSERT OR IGNORE INTO content_hashes(hash, expires_at, state, owner) VALUES(?, ?, 'committed', NULL)"
+        `INSERT INTO content_hashes(hash, expires_at, state, owner, unknown_since)
+         VALUES(?, ?, 'committed', NULL, NULL)
+         ON CONFLICT(hash) DO UPDATE SET
+           expires_at = excluded.expires_at,
+           state = 'committed',
+           owner = NULL,
+           unknown_since = NULL
+         WHERE content_hashes.state != 'unknown'
+           AND content_hashes.expires_at < ?`
       )
-      .run(hash, expiresAt);
+      .run(hash, expiresAt, now);
   }
 
   unknownStats(): { count: number; oldestAt: number | null } {

@@ -51,11 +51,12 @@ describe('BrainClient — API calls', () => {
     expect(result.query).toBe('test');
   });
 
-  it('calls save endpoint', async () => {
+  it.each([200, 201])('accepts documented successful save status %i', async (status) => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
+      status,
       json: async () => ({
-        id: '123',
+        id: '123e4567-e89b-42d3-a456-426614174000',
         type: 'decision',
         content: 'Test content',
         tags: ['test'],
@@ -75,7 +76,84 @@ describe('BrainClient — API calls', () => {
       'http://localhost:3001/api/brain/entries',
       expect.objectContaining({ method: 'POST' })
     );
-    expect(result.id).toBe('123');
+    expect(result.id).toBe('123e4567-e89b-42d3-a456-426614174000');
+  });
+
+  it.each([
+    {
+      name: 'minimum documented lengths',
+      content: '',
+      summary: '',
+      tags: ['x'],
+    },
+    {
+      name: 'maximum documented lengths',
+      content: 'c'.repeat(10_000),
+      summary: 's'.repeat(200),
+      // The domain contract constrains cardinality and non-empty values, but
+      // deliberately does not invent a maximum tag length for Backend entries.
+      tags: ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 't'.repeat(65)],
+    },
+  ])('accepts valid BrainEntry domain boundaries: $name', async (boundary) => {
+    const entry = {
+      id: '123e4567-e89b-42d3-a456-426614174000',
+      type: 'conversation',
+      content: boundary.content,
+      summary: boundary.summary,
+      tags: boundary.tags,
+      timestamp: '2026-11-28T12:00:00.000+04:00',
+      source: {
+        tool: 'manual',
+        session_id: '',
+        project: 'project',
+        file: 'context.md',
+        user_id: 'operator-1',
+      },
+      metadata: { confidence: 1 },
+    };
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => entry,
+    });
+
+    await expect(client.save({
+      type: 'conversation',
+      content: boundary.content,
+      summary: boundary.summary,
+      tags: boundary.tags,
+      source: entry.source,
+      metadata: entry.metadata,
+    })).resolves.toMatchObject({
+      id: entry.id,
+      content: boundary.content,
+      summary: boundary.summary,
+      tags: boundary.tags,
+    });
+  });
+
+  it.each([202, 204])('does not treat HTTP %i as a confirmed Brain save', async (status) => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      status,
+      json: status === 204
+        ? async () => { throw new SyntaxError('Unexpected end of JSON input'); }
+        : async () => ({
+            id: '123e4567-e89b-42d3-a456-426614174000',
+            type: 'decision',
+            content: 'Test content',
+            tags: ['test'],
+            timestamp: new Date().toISOString(),
+            source: { tool: 'claude-code' },
+          }),
+    });
+
+    await expect(client.save({
+      type: 'decision',
+      content: 'Test content',
+      tags: ['test'],
+      source: { tool: 'claude-code' },
+    })).rejects.toMatchObject({ code: 'BRAIN_HTTP_ERROR' });
   });
 
   it.each([
@@ -95,6 +173,55 @@ describe('BrainClient — API calls', () => {
       content: 'Test content',
       tags: [],
       timestamp: 'not-a-date',
+      source: { tool: 'claude-code' },
+    },
+    {
+      id: 'not-a-uuid',
+      type: 'decision',
+      content: 'Test content',
+      tags: ['test'],
+      timestamp: new Date().toISOString(),
+      source: { tool: 'claude-code' },
+    },
+    {
+      id: '123e4567-e89b-42d3-a456-426614174000',
+      type: 'decision',
+      content: 'x'.repeat(10_001),
+      tags: ['test'],
+      timestamp: new Date().toISOString(),
+      source: { tool: 'claude-code' },
+    },
+    {
+      id: '123e4567-e89b-42d3-a456-426614174000',
+      type: 'decision',
+      content: 'Test content',
+      tags: [],
+      timestamp: new Date().toISOString(),
+      source: { tool: 'claude-code' },
+    },
+    {
+      id: '123e4567-e89b-42d3-a456-426614174000',
+      type: 'decision',
+      content: 'Test content',
+      tags: [' '],
+      timestamp: new Date().toISOString(),
+      source: { tool: 'claude-code' },
+    },
+    {
+      id: '123e4567-e89b-42d3-a456-426614174000',
+      type: 'decision',
+      content: 'Test content',
+      tags: Array.from({ length: 11 }, (_, i) => `tag-${i}`),
+      timestamp: new Date().toISOString(),
+      source: { tool: 'claude-code' },
+    },
+    {
+      id: '123e4567-e89b-42d3-a456-426614174000',
+      type: 'decision',
+      content: 'Test content',
+      summary: 's'.repeat(201),
+      tags: ['test'],
+      timestamp: new Date().toISOString(),
       source: { tool: 'claude-code' },
     },
   ])('rejects malformed 2xx BrainEntry response %#', async (body) => {
