@@ -80,6 +80,49 @@ describe('AutoMemoryMiddleware analysis tag boundary', () => {
     }
   });
 
+  it.each([
+    ['empty tag list', []],
+    ['whitespace-only tag', ['   ']],
+  ])('keeps invalid analysis out of persistent SQLite and Brain dispatch: %s', async (label, tags) => {
+    const directory = mkdtempSync(join(tmpdir(), 'master-brain-auto-memory-tags-sqlite-'));
+    const databasePath = join(directory, 'dedup.sqlite');
+    const dedup = createDedupStore(databasePath, { requireSqlite: true });
+    const mw = new AutoMemoryMiddleware({ enabled: true, minConfidence: 0.7 }, dedup);
+    installAnalyzer(mw, tags);
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 201,
+      json: async () => ({
+        id: '123e4567-e89b-42d3-a456-426614174000',
+        type: 'decision',
+        content: 'A durable decision',
+        tags: ['backend-valid'],
+        timestamp: '2026-11-25T00:00:00.000Z',
+        source: { tool: 'manual' },
+      }),
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const request = 'sqlite-invalid-tags-' + label;
+    const response = 'response';
+    const hash = contentHash(request + '\n---\n' + response);
+
+    try {
+      await expect(mw.processInteraction(request, response, { tool: 'manual' }))
+        .resolves.toMatchObject({ saved: false, reason: 'below_threshold' });
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(dedup.status(hash)).toBeNull();
+    } finally {
+      mw.close();
+      const reopened = createDedupStore(databasePath, { requireSqlite: true });
+      try {
+        expect(reopened.status(hash)).toBeNull();
+      } finally {
+        reopened.close();
+        rmSync(directory, { recursive: true, force: true });
+      }
+    }
+  });
+
   it('trims and lowercases valid tags before the Brain write', async () => {
     const dedup = memoryDedup();
     const mw = new AutoMemoryMiddleware({ enabled: true, minConfidence: 0.7 }, dedup);
