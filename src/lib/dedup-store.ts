@@ -42,7 +42,12 @@ export interface ResolveUnknownOptions {
 
 export type ResolveUnknownResult =
   | { ok: true; hashPrefix: string; outcome: UnknownOutcome }
-  | { ok: false; reason: 'invalid_prefix' | 'not_found' | 'ambiguous' | 'too_recent' | 'missing_timestamp' };
+  | { ok: false; reason: 'invalid_prefix' | 'not_found' | 'ambiguous' | 'too_recent' | 'in_flight' | 'missing_timestamp' };
+
+/** Read-only preview of what `resolveUnknown` would do; never changes state. */
+export type InspectUnknownResult =
+  | { ok: true; hashPrefix: string; unknownSince: number; eligibleAt: number; budgetKnown: boolean }
+  | { ok: false; reason: 'invalid_prefix' | 'not_found' | 'ambiguous' | 'too_recent' | 'in_flight' | 'missing_timestamp' };
 
 export interface ResolutionRecord {
   at: number;
@@ -65,7 +70,9 @@ export interface DedupStore {
   /** Atomically reserve `hash` for `leaseMinutes`. Returns an owner token, or null when blocked. */
   claim(hash: string, leaseMinutes: number): string | null;
   /** Atomically quarantine the current owner's pending claim before external write dispatch. */
-  markUnknown(hash: string, token: string): boolean;
+  markUnknown(hash: string, token: string, inFlightBudgetMs?: number): boolean;
+  /** Read-only: which single UNKNOWN row a prefix identifies and when an operator may resolve it. */
+  inspectUnknown(hashPrefix: string, options: { minAgeMs: number; now?: number }): InspectUnknownResult;
   /** Remove UNKNOWN only when the same owner proves the request was never dispatched. */
   revertUnknown(hash: string, token: string): boolean;
   /** Commit only the matching current owner; stale owners must never overwrite another claim. */
@@ -96,6 +103,8 @@ interface MemoryEntry {
   state: DedupState;
   owner: string | null;
   unknownSince: number | null;
+  /** Earliest time an operator may resolve this UNKNOWN (the request cannot still be in flight). */
+  resolveNotBefore?: number | null;
 }
 
 class MemoryDedupStore implements DedupStore {
@@ -129,12 +138,15 @@ class MemoryDedupStore implements DedupStore {
     return owner;
   }
 
-  markUnknown(hash: string, token: string): boolean {
+  markUnknown(hash: string, token: string, inFlightBudgetMs?: number): boolean {
     const e = this.live(hash);
     if (!e || e.state !== 'pending' || e.owner !== token) return false;
+    const now = Date.now();
+    const resolveNotBefore = notBefore(now, inFlightBudgetMs); // may throw: validate before mutating
     e.state = 'unknown';
     e.exp = Number.POSITIVE_INFINITY;
-    e.unknownSince = Date.now();
+    e.unknownSince = now;
+    e.resolveNotBefore = resolveNotBefore;
     return true;
   }
 
@@ -207,10 +219,8 @@ class MemoryDedupStore implements DedupStore {
     if (matches.length > 1) return { ok: false, reason: 'ambiguous' };
     const [hash, entry] = matches[0];
     const now = options.now ?? Date.now();
-    if (entry.unknownSince === null) return { ok: false, reason: 'missing_timestamp' };
-    if (now - entry.unknownSince < options.minAgeMs) {
-      return { ok: false, reason: 'too_recent' };
-    }
+    const blocked = resolveBlock(entry.unknownSince, entry.resolveNotBefore ?? null, now, options.minAgeMs);
+    if (blocked) return { ok: false, reason: blocked };
     const expiresAt =
       options.outcome === 'stored'
         ? expiresAtForTtl(options.ttlMinutes ?? DEFAULT_RESOLVE_TTL_MINUTES, now)
@@ -228,6 +238,18 @@ class MemoryDedupStore implements DedupStore {
       note: normalizeNote(options.note),
     });
     return { ok: true, hashPrefix: hash.slice(0, 12), outcome: options.outcome };
+  }
+
+  inspectUnknown(hashPrefix: string, options: { minAgeMs: number; now?: number }): InspectUnknownResult {
+    const prefix = normalizePrefix(hashPrefix);
+    if (!prefix) return { ok: false, reason: 'invalid_prefix' };
+    const matches = [...this.entries.entries()].filter(
+      ([hash, entry]) => entry.state === 'unknown' && hash.startsWith(prefix)
+    );
+    if (matches.length === 0) return { ok: false, reason: 'not_found' };
+    if (matches.length > 1) return { ok: false, reason: 'ambiguous' };
+    const [hash, entry] = matches[0];
+    return inspectRow(hash, entry.unknownSince, entry.resolveNotBefore ?? null, options);
   }
 
   listResolutions(limit = 100): ResolutionRecord[] {
@@ -293,6 +315,7 @@ class SqliteDedupStore implements DedupStore {
         "ALTER TABLE content_hashes ADD COLUMN state TEXT NOT NULL DEFAULT 'committed'",
         'ALTER TABLE content_hashes ADD COLUMN owner TEXT',
         'ALTER TABLE content_hashes ADD COLUMN unknown_since INTEGER',
+        'ALTER TABLE content_hashes ADD COLUMN resolve_not_before INTEGER',
       ]) {
         try {
           this.db.exec(ddl);
@@ -362,7 +385,8 @@ class SqliteDedupStore implements DedupStore {
            expires_at = excluded.expires_at,
            state = 'pending',
            owner = excluded.owner,
-           unknown_since = NULL
+           unknown_since = NULL,
+           resolve_not_before = NULL
          WHERE content_hashes.state != 'unknown'
            AND content_hashes.expires_at < ?`
       )
@@ -370,14 +394,14 @@ class SqliteDedupStore implements DedupStore {
     return result.changes === 1 ? owner : null;
   }
 
-  markUnknown(hash: string, token: string): boolean {
+  markUnknown(hash: string, token: string, inFlightBudgetMs?: number): boolean {
     const now = Date.now();
     const result = this.db
       .prepare(
-        `UPDATE content_hashes SET state = 'unknown', expires_at = ?, unknown_since = ?
+        `UPDATE content_hashes SET state = 'unknown', expires_at = ?, unknown_since = ?, resolve_not_before = ?
          WHERE hash = ? AND state = 'pending' AND owner = ? AND expires_at >= ?`
       )
-      .run(Number.MAX_SAFE_INTEGER, now, hash, token, now);
+      .run(Number.MAX_SAFE_INTEGER, now, notBefore(now, inFlightBudgetMs), hash, token, now);
     return result.changes === 1;
   }
 
@@ -393,7 +417,7 @@ class SqliteDedupStore implements DedupStore {
     const expiresAt = expiresAtForTtl(ttlMinutes, now);
     const result = this.db
       .prepare(
-        `UPDATE content_hashes SET state = 'committed', owner = NULL, expires_at = ?, unknown_since = NULL
+        `UPDATE content_hashes SET state = 'committed', owner = NULL, expires_at = ?, unknown_since = NULL, resolve_not_before = NULL
          WHERE hash = ? AND owner = ?
            AND state = 'unknown'`
       )
@@ -418,7 +442,8 @@ class SqliteDedupStore implements DedupStore {
            expires_at = excluded.expires_at,
            state = 'committed',
            owner = NULL,
-           unknown_since = NULL
+           unknown_since = NULL,
+           resolve_not_before = NULL
          WHERE content_hashes.state != 'unknown'
            AND content_hashes.expires_at < ?`
       )
@@ -454,15 +479,26 @@ class SqliteDedupStore implements DedupStore {
     try {
       const rows = this.db
         .prepare(
-          "SELECT hash, unknown_since AS unknownSince FROM content_hashes WHERE state = 'unknown' AND substr(hash, 1, ?) = ? LIMIT 2"
+          "SELECT hash, unknown_since AS unknownSince, resolve_not_before AS resolveNotBefore FROM content_hashes WHERE state = 'unknown' AND substr(hash, 1, ?) = ? LIMIT 2"
         )
-        .all(prefix.length, prefix) as Array<{ hash: string; unknownSince: number | null }>;
+        .all(prefix.length, prefix) as Array<{
+        hash: string;
+        unknownSince: number | null;
+        resolveNotBefore: number | null;
+      }>;
       let result: ResolveUnknownResult;
       if (rows.length === 0) result = { ok: false, reason: 'not_found' };
       else if (rows.length > 1) result = { ok: false, reason: 'ambiguous' };
-      else if (rows[0].unknownSince === null) result = { ok: false, reason: 'missing_timestamp' };
-      else if (now - rows[0].unknownSince < options.minAgeMs) {
-        result = { ok: false, reason: 'too_recent' };
+      else if (
+        resolveBlock(rows[0].unknownSince, rows[0].resolveNotBefore ?? null, now, options.minAgeMs) !== null
+      ) {
+        result = {
+          ok: false,
+          reason: resolveBlock(rows[0].unknownSince, rows[0].resolveNotBefore ?? null, now, options.minAgeMs) as
+            | 'too_recent'
+            | 'in_flight'
+            | 'missing_timestamp',
+        };
       } else {
         const { hash } = rows[0];
         const changed =
@@ -470,7 +506,7 @@ class SqliteDedupStore implements DedupStore {
             ? this.db.prepare("DELETE FROM content_hashes WHERE hash = ? AND state = 'unknown'").run(hash)
             : this.db
                 .prepare(
-                  `UPDATE content_hashes SET state = 'committed', owner = NULL, expires_at = ?, unknown_since = NULL
+                  `UPDATE content_hashes SET state = 'committed', owner = NULL, expires_at = ?, unknown_since = NULL, resolve_not_before = NULL
                    WHERE hash = ? AND state = 'unknown'`
                 )
                 .run(ttlExpiry, hash);
@@ -495,6 +531,23 @@ class SqliteDedupStore implements DedupStore {
       }
       throw error;
     }
+  }
+
+  inspectUnknown(hashPrefix: string, options: { minAgeMs: number; now?: number }): InspectUnknownResult {
+    const prefix = normalizePrefix(hashPrefix);
+    if (!prefix) return { ok: false, reason: 'invalid_prefix' };
+    const rows = this.db
+      .prepare(
+        "SELECT hash, unknown_since AS unknownSince, resolve_not_before AS resolveNotBefore FROM content_hashes WHERE state = 'unknown' AND substr(hash, 1, ?) = ? LIMIT 2"
+      )
+      .all(prefix.length, prefix) as Array<{
+      hash: string;
+      unknownSince: number | null;
+      resolveNotBefore: number | null;
+    }>;
+    if (rows.length === 0) return { ok: false, reason: 'not_found' };
+    if (rows.length > 1) return { ok: false, reason: 'ambiguous' };
+    return inspectRow(rows[0].hash, rows[0].unknownSince, rows[0].resolveNotBefore ?? null, options);
   }
 
   listResolutions(limit = 100): ResolutionRecord[] {
@@ -531,6 +584,59 @@ class SqliteDedupStore implements DedupStore {
   }
 }
 
+/** C0/C1 controls, DEL, line/paragraph separators and bidi overrides (log, terminal and display spoofing). */
+// ZWNJ (U+200C) is deliberately kept: it is legitimate in Persian text.
+const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f\u00ad\u180e\u200b\u200e\u200f\u2028\u2029\u061c\u2060-\u2064\u202a-\u202e\u2066-\u2069\ufeff\ufff9-\ufffb\u{e0000}-\u{e007f}]/gu;
+
+/** Print-time sanitiser: rows written by older binaries or directly into the file may hold control characters. */
+export function sanitizeForDisplay(value: unknown): string {
+  return String(value ?? '').replace(CONTROL_CHARS, ' ');
+}
+
+/** `resolveNotBefore` for an UNKNOWN row: when the request's own timeout budget has certainly elapsed. */
+function notBefore(now: number, inFlightBudgetMs: number | undefined): number | null {
+  if (inFlightBudgetMs === undefined) return null;
+  const at = now + inFlightBudgetMs;
+  // A silent NULL would fail open (the entry would look like a legacy row), so reject bad budgets.
+  if (!Number.isFinite(inFlightBudgetMs) || inFlightBudgetMs <= 0 || !Number.isSafeInteger(at)) {
+    throw new RangeError('markUnknown: inFlightBudgetMs must be a positive finite number');
+  }
+  return at;
+}
+
+/** Why an operator may NOT resolve this row yet, or null when it is eligible. */
+function resolveBlock(
+  unknownSince: number | null,
+  resolveNotBefore: number | null,
+  now: number,
+  minAgeMs: number
+): 'missing_timestamp' | 'too_recent' | 'in_flight' | null {
+  if (unknownSince === null) return 'missing_timestamp';
+  if (resolveNotBefore !== null && now < resolveNotBefore) return 'in_flight';
+  if (now - unknownSince < minAgeMs) return 'too_recent';
+  return null;
+}
+
+function inspectRow(
+  hash: string,
+  unknownSince: number | null,
+  resolveNotBefore: number | null,
+  options: { minAgeMs: number; now?: number }
+): InspectUnknownResult {
+  const now = options.now ?? Date.now();
+  const blocked = resolveBlock(unknownSince, resolveNotBefore, now, options.minAgeMs);
+  if (blocked === 'missing_timestamp') return { ok: false, reason: blocked };
+  const eligibleAt = Math.max((unknownSince as number) + options.minAgeMs, resolveNotBefore ?? 0);
+  if (blocked) return { ok: false, reason: blocked };
+  return {
+    ok: true,
+    hashPrefix: hash.slice(0, 12),
+    unknownSince: unknownSince as number,
+    eligibleAt,
+    budgetKnown: resolveNotBefore !== null,
+  };
+}
+
 function normalizePrefix(value: string): string | null {
   const prefix = typeof value === 'string' ? value.trim().toLowerCase() : '';
   return HASH_PREFIX_PATTERN.test(prefix) ? prefix : null;
@@ -542,13 +648,13 @@ function normalizeLimit(limit: number): number {
 
 /** Audit fields are bounded and stripped of control characters (log/terminal injection). */
 function normalizeOperator(value: string): string {
-  const cleaned = String(value ?? '').replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 64);
+  const cleaned = String(value ?? '').replace(CONTROL_CHARS, ' ').trim().slice(0, 64);
   return cleaned || 'unknown';
 }
 
 function normalizeNote(value: string | undefined): string | null {
   if (value === undefined) return null;
-  const cleaned = String(value).replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 200);
+  const cleaned = String(value).replace(CONTROL_CHARS, ' ').trim().slice(0, 200);
   return cleaned || null;
 }
 
@@ -585,11 +691,11 @@ export interface CreateDedupStoreOptions {
   loadDriver?: () => unknown;
 }
 
-export function createDedupStore(explicitPath?: string, options: CreateDedupStoreOptions = {}): DedupStore {
-  const requireSqlite =
-    process.env.NODE_ENV === 'production' ||
-    options.requireSqlite === true ||
-    ['1', 'true'].includes((process.env.DEDUP_REQUIRE_SQLITE ?? '').toLowerCase());
+/**
+ * Where the dedup database lives (the same resolution `createDedupStore` uses), and whether the
+ * location was configured explicitly rather than falling back to the cwd-dependent default.
+ */
+export function locateDedupDb(explicitPath?: string): { path: string; configured: boolean } {
   const configuredDbPath = process.env.DEDUP_DB_PATH?.trim();
   const configuredDataDir = process.env.DATA_DIR?.trim();
   const configuredEnvPath = configuredDbPath ||
@@ -604,6 +710,15 @@ export function createDedupStore(explicitPath?: string, options: CreateDedupStor
       '[DedupStore] production requires an absolute DEDUP_DB_PATH or DATA_DIR; refusing a cwd-dependent SQLite location'
     );
   }
+  return { path, configured: Boolean(configuredPath) };
+}
+
+export function createDedupStore(explicitPath?: string, options: CreateDedupStoreOptions = {}): DedupStore {
+  const requireSqlite =
+    process.env.NODE_ENV === 'production' ||
+    options.requireSqlite === true ||
+    ['1', 'true'].includes((process.env.DEDUP_REQUIRE_SQLITE ?? '').toLowerCase());
+  const { path } = locateDedupDb(explicitPath);
 
   try {
     return new SqliteDedupStore(path, options.loadDriver);
