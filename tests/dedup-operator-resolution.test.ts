@@ -2,6 +2,7 @@
 // quarantine log line. Every store behavior runs against BOTH the in-memory and SQLite backends.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createServer, type Server } from 'node:http';
+import { spawn } from 'node:child_process';
 import type { AddressInfo } from 'node:net';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -266,6 +267,159 @@ describe('operator resolution — SQLite durability', () => {
       reopened.close();
     }
   });
+});
+
+
+describe('SQLite operator-resolution concurrency and rollback', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'dedup-op-atomicity-'));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('races two independent SQLite processes and records exactly one resolution', async () => {
+    const path = join(dir, 'race.sqlite');
+    const hash = hex(110);
+    const seed = createDedupStore(path, { requireSqlite: true });
+    quarantine(seed, hash);
+    seed.close();
+
+    const childScript = [
+      "import { createDedupStore } from './src/lib/dedup-store.ts';",
+      "const path = process.argv[1];",
+      "const prefix = process.argv[2];",
+      "const operator = process.argv[3];",
+      "const store = createDedupStore(path, { requireSqlite: true });",
+      "process.stdout.write('READY\\n');",
+      "let input = '';",
+      "for await (const chunk of process.stdin) {",
+      "  input += chunk.toString();",
+      "  if (input.includes('\\n')) break;",
+      "}",
+      "if (input.trim() !== 'GO') {",
+      "  store.close();",
+      "  process.exitCode = 2;",
+      "} else {",
+      "  const result = store.resolveUnknown(prefix, { outcome: 'not_stored', operator, minAgeMs: 0 });",
+      "  process.stdout.write('RESULT:' + JSON.stringify(result) + '\\n');",
+      "  store.close();",
+      "}",
+    ].join('\n');
+
+    const startWorker = (operator: string) => {
+      const child = spawn(
+        process.execPath,
+        ['--import', 'tsx', '--input-type=module', '-e', childScript, path, hash.slice(0, 24), operator],
+        { cwd: process.cwd(), env: process.env, stdio: ['pipe', 'pipe', 'pipe'] }
+      );
+      let stdout = '';
+      let stderr = '';
+      let resolveReady!: () => void;
+      let rejectReady!: (error: Error) => void;
+      let resolveResult!: (value: { ok: boolean; reason?: string }) => void;
+      let rejectResult!: (error: Error) => void;
+      const readyPromise = new Promise<void>((resolve, reject) => {
+        resolveReady = resolve;
+        rejectReady = reject;
+      });
+      const resultPromise = new Promise<{ ok: boolean; reason?: string }>((resolve, reject) => {
+        resolveResult = resolve;
+        rejectResult = reject;
+      });
+
+      child.stdout.setEncoding('utf8').on('data', (chunk: string) => {
+        stdout += chunk;
+        const lines = stdout.split('\n');
+        if (lines.includes('READY')) resolveReady();
+        const resultLine = lines.find((line) => line.startsWith('RESULT:'));
+        if (resultLine) {
+          resolveResult(JSON.parse(resultLine.slice('RESULT:'.length)) as { ok: boolean; reason?: string });
+        }
+      });
+      child.stderr.setEncoding('utf8').on('data', (chunk: string) => {
+        stderr += chunk;
+      });
+      child.once('error', (error) => {
+        rejectReady(error);
+        rejectResult(error);
+      });
+      child.once('close', (code) => {
+        if (code !== 0) {
+          const error = new Error('resolution worker failed (' + code + '): ' + stderr);
+          rejectReady(error);
+          rejectResult(error);
+        } else if (!stdout.split('\n').some((line) => line.startsWith('RESULT:'))) {
+          rejectResult(new Error('resolution worker exited without a result: ' + stdout));
+        }
+      });
+      return { child, readyPromise, resultPromise };
+    };
+
+    const workers = [startWorker('operator-a'), startWorker('operator-b')];
+    const timeout = setTimeout(() => {
+      for (const worker of workers) worker.child.kill('SIGKILL');
+    }, 10_000);
+
+    try {
+      await Promise.all(workers.map((worker) => worker.readyPromise));
+      for (const worker of workers) worker.child.stdin.write('GO\n');
+
+      const results = await Promise.all(workers.map((worker) => worker.resultPromise));
+      expect(results.filter((result) => result.ok)).toHaveLength(1);
+      expect(results.filter((result) => !result.ok && result.reason === 'not_found')).toHaveLength(1);
+
+      const verification = createDedupStore(path, { requireSqlite: true });
+      try {
+        expect(verification.status(hash)).toBeNull();
+        expect(verification.listResolutions()).toHaveLength(1);
+      } finally {
+        verification.close();
+      }
+    } finally {
+      clearTimeout(timeout);
+      for (const worker of workers) {
+        if (worker.child.exitCode === null && !worker.child.killed) worker.child.kill('SIGTERM');
+      }
+    }
+  }, 20_000);
+
+  it.each(['not_stored', 'stored'] as const)(
+    'rolls back the UNKNOWN state mutation when the audit INSERT fails (%s)',
+    (outcome) => {
+      const path = join(dir, 'rollback-' + outcome + '.sqlite');
+      const hash = hex(outcome === 'stored' ? 112 : 111);
+      const store = createDedupStore(path, { requireSqlite: true });
+      quarantine(store, hash);
+
+      const Database = require('better-sqlite3') as new (filename: string) => {
+        exec(sql: string): void;
+        close(): void;
+      };
+      const raw = new Database(path);
+      try {
+        raw.exec("CREATE TRIGGER fail_unknown_audit_insert BEFORE INSERT ON unknown_resolutions BEGIN SELECT RAISE(ABORT, 'injected audit insert failure'); END;");
+      } finally {
+        raw.close();
+      }
+
+      try {
+        expect(() => store.resolveUnknown(hash, {
+          outcome,
+          operator: 'test-operator',
+          minAgeMs: 0,
+        })).toThrow(/injected audit insert failure/);
+        expect(store.status(hash)).toBe('unknown');
+        expect(store.unknownStats().count).toBe(1);
+        expect(store.listResolutions()).toHaveLength(0);
+      } finally {
+        store.close();
+      }
+    }
+  );
 });
 
 describe('dedup-admin CLI', () => {
