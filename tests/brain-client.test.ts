@@ -51,10 +51,10 @@ describe('BrainClient — API calls', () => {
     expect(result.query).toBe('test');
   });
 
-  it('calls save endpoint', async () => {
+  it.each([200, 201])('accepts documented successful save status %i', async (status) => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
-      status: 201,
+      status,
       json: async () => ({
         id: '123e4567-e89b-42d3-a456-426614174000',
         type: 'decision',
@@ -83,14 +83,16 @@ describe('BrainClient — API calls', () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
       status,
-      json: async () => ({
-        id: '123e4567-e89b-42d3-a456-426614174000',
-        type: 'decision',
-        content: 'Test content',
-        tags: ['test'],
-        timestamp: new Date().toISOString(),
-        source: { tool: 'claude-code' },
-      }),
+      json: status === 204
+        ? async () => { throw new SyntaxError('Unexpected end of JSON input'); }
+        : async () => ({
+            id: '123e4567-e89b-42d3-a456-426614174000',
+            type: 'decision',
+            content: 'Test content',
+            tags: ['test'],
+            timestamp: new Date().toISOString(),
+            source: { tool: 'claude-code' },
+          }),
     });
 
     await expect(client.save({
