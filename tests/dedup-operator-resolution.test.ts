@@ -301,6 +301,64 @@ describe('dedup-admin CLI', () => {
     expect(out.join('\n')).toContain('--yes');
   });
 
+  it('treats explicit --yes false as a dry run and preserves UNKNOWN plus audit state', () => {
+    const hash = hex(105);
+    const token = store.claim(hash, 5) as string;
+    store.markUnknown(hash, token, MIN); // Known in-flight budget; use a later time for eligibility.
+    const code = runCli(
+      ['resolve', hash.slice(0, 12), '--outcome', 'not_stored', '--yes', 'false'],
+      { store, io, operator: 'dana', now: Date.now() + 60 * MIN }
+    );
+
+    expect(code).toBe(EXIT_CONFIRM);
+    expect(store.status(hash)).toBe('unknown');
+    expect(store.listResolutions()).toHaveLength(0);
+    expect(out.join('\\n')).toContain('Dry run only');
+  });
+
+  it('does not treat --acknowledge-legacy-budget false as an acknowledgement', () => {
+    const hash = hex(106);
+    const token = store.claim(hash, 5) as string;
+    store.markUnknown(hash, token); // Legacy row has no persisted in-flight budget.
+    const code = runCli(
+      ['resolve', hash.slice(0, 12), '--outcome', 'not_stored', '--yes', '--acknowledge-legacy-budget', 'false'],
+      { store, io, operator: 'dana', now: Date.now() + 60 * MIN }
+    );
+
+    expect(code).toBe(EXIT_REFUSED);
+    expect(store.status(hash)).toBe('unknown');
+    expect(store.listResolutions()).toHaveLength(0);
+    expect(err.join('\\n')).toContain('older Hub');
+  });
+
+  it('rejects duplicate boolean flags instead of allowing a later token to override intent', () => {
+    const hash = hex(107);
+    const token = store.claim(hash, 5) as string;
+    store.markUnknown(hash, token, MIN);
+    const code = runCli(
+      ['resolve', hash.slice(0, 12), '--outcome', 'not_stored', '--yes', 'false', '--yes'],
+      { store, io, operator: 'dana', now: Date.now() + 60 * MIN }
+    );
+
+    expect(code).toBe(EXIT_USAGE);
+    expect(store.status(hash)).toBe('unknown');
+    expect(store.listResolutions()).toHaveLength(0);
+  });
+
+  it('rejects unknown flags and extra positional arguments before resolution', () => {
+    const hash = hex(108);
+    const token = store.claim(hash, 5) as string;
+    store.markUnknown(hash, token, MIN);
+    const code = runCli(
+      ['resolve', hash.slice(0, 12), 'unexpected', '--outcome', 'not_stored', '--yes', '--force'],
+      { store, io, operator: 'dana', now: Date.now() + 60 * MIN }
+    );
+
+    expect(code).toBe(EXIT_USAGE);
+    expect(store.status(hash)).toBe('unknown');
+    expect(store.listResolutions()).toHaveLength(0);
+  });
+
   it('resolve --yes applies, records the operator and the note, and audit prints it', () => {
     quarantine(store, hex(102));
     const code = runCli(
