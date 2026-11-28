@@ -88,9 +88,14 @@ const REFUSAL_TEXT: Record<string, string> = {
   missing_timestamp: 'The UNKNOWN entry has no quarantine timestamp; refusing to resolve corrupted or legacy state.',
 };
 
-function parseFlags(args: string[]): { positional: string[]; flags: Map<string, string | true> } {
+function parseFlags(args: string[]): {
+  positional: string[];
+  flags: Map<string, string | boolean>;
+  duplicates: string[];
+} {
   const positional: string[] = [];
-  const flags = new Map<string, string | true>();
+  const flags = new Map<string, string | boolean>();
+  const duplicates: string[] = [];
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
     if (!arg.startsWith('--')) {
@@ -99,14 +104,28 @@ function parseFlags(args: string[]): { positional: string[]; flags: Map<string, 
     }
     const name = arg.slice(2);
     const next = args[i + 1];
-    if (name === 'yes' || name === 'acknowledge-legacy-budget' || next === undefined || next.startsWith('--')) {
+    if (flags.has(name)) duplicates.push(name);
+
+    // Confirmation and legacy-budget acknowledgement are boolean gates.
+    // A literal "false" must never be swallowed as an affirmative bare flag.
+    if (name === 'yes' || name === 'acknowledge-legacy-budget') {
+      if (next === 'true' || next === 'false') {
+        flags.set(name, next === 'true');
+        i += 1;
+      } else {
+        flags.set(name, true);
+      }
+      continue;
+    }
+
+    if (next === undefined || next.startsWith('--')) {
       flags.set(name, true);
     } else {
       flags.set(name, next);
       i += 1;
     }
   }
-  return { positional, flags };
+  return { positional, flags, duplicates };
 }
 
 function positiveNumber(value: string | true | undefined, fallback: number): number | null {
@@ -145,7 +164,22 @@ export function runCli(argv: string[], options: CliOptions = {}): number {
       store = createDedupStore(undefined, { requireSqlite: true });
       io.out(`Dedup database: ${location.path}`);
     }
-    const { positional, flags } = parseFlags(rest);
+    const { positional, flags, duplicates } = parseFlags(rest);
+    const allowedFlags =
+      command === 'resolve'
+        ? new Set(['outcome', 'ttl-minutes', 'min-age-minutes', 'note', 'yes', 'acknowledge-legacy-budget'])
+        : command === 'audit'
+          ? new Set(['limit'])
+          : new Set<string>();
+    const expectedPositionals = command === 'resolve' ? 1 : 0;
+    if (
+      positional.length !== expectedPositionals ||
+      duplicates.length > 0 ||
+      [...flags.keys()].some((name) => !allowedFlags.has(name))
+    ) {
+      io.err(USAGE);
+      return EXIT_USAGE;
+    }
 
     if (command === 'list') {
       const rows = store.listUnknown(1000);
