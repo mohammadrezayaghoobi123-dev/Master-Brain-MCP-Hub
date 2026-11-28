@@ -76,7 +76,39 @@ describe('BrainClient — API calls', () => {
       'http://localhost:3001/api/brain/entries',
       expect.objectContaining({ method: 'POST' })
     );
+    const requestOptions = mockFetch.mock.calls[0][1] as RequestInit;
+    expect(requestOptions.headers).not.toHaveProperty('Idempotency-Key');
     expect(result.id).toBe('123e4567-e89b-42d3-a456-426614174000');
+  });
+
+  it('sends Idempotency-Key only when metadata.contentHash is supplied', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      status: 201,
+      json: async () => ({
+        id: '123e4567-e89b-42d3-a456-426614174000',
+        type: 'decision',
+        content: 'Test content',
+        tags: ['test'],
+        timestamp: new Date().toISOString(),
+        source: { tool: 'auto-memory' },
+        metadata: { contentHash: 'a'.repeat(64) },
+      }),
+    });
+
+    await client.save({
+      type: 'decision',
+      content: 'Test content',
+      tags: ['test'],
+      source: { tool: 'auto-memory' },
+      metadata: { contentHash: 'a'.repeat(64) },
+    });
+
+    const requestOptions = mockFetch.mock.calls[0][1] as RequestInit;
+    expect(requestOptions.headers).toMatchObject({
+      Authorization: 'Bearer test-key',
+      'Idempotency-Key': 'a'.repeat(64),
+    });
   });
 
   it.each([
