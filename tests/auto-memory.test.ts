@@ -394,6 +394,7 @@ describe('AutoMemoryMiddleware concurrent session limits', () => {
 
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
+      status: 201,
       json: async () => ({
         id: '123e4567-e89b-42d3-a456-426614174000',
         type: 'decision',
