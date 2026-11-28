@@ -11,7 +11,7 @@
 //   3. model importance classification
 //   4. confidence hard floor + config min
 //   5. excludeTypes + non-empty tags
-//   6. brain.save → then record dedup + session count
+//   6. brain.save (Idempotency-Key=contentHash) → then record dedup + session count
 
 import Anthropic from '@anthropic-ai/sdk';
 import { z } from 'zod';
@@ -182,7 +182,6 @@ export class AutoMemoryMiddleware {
     }
 
     if (!analysis.isImportant) {
-      // Distinguish model reject vs hard-floor override when possible
       if (analysis.confidence > 0 && analysis.confidence < CONFIDENCE_HARD_FLOOR) {
         return { saved: false, reason: 'below_hard_floor', entry: analysis };
       }
@@ -210,21 +209,23 @@ export class AutoMemoryMiddleware {
     }
 
     const brain = getBrainClient();
-    await brain.save({
-      type: analysis.type,
-      content: analysis.summary,
-      tags: analysis.tags,
-      source: { ...source, tool: source.tool === 'manual' ? 'manual' : 'auto-memory' },
-      metadata: {
-        confidence: analysis.confidence,
-        originalRequest: request.substring(0, 500),
-        context: analysis.context,
-        contentHash: hash,
-        effectiveMinConfidence: effectiveMin,
+    await brain.save(
+      {
+        type: analysis.type,
+        content: analysis.summary,
+        tags: analysis.tags,
+        source: { ...source, tool: source.tool === 'manual' ? 'manual' : 'auto-memory' },
+        metadata: {
+          confidence: analysis.confidence,
+          originalRequest: request.substring(0, 500),
+          context: analysis.context,
+          contentHash: hash,
+          effectiveMinConfidence: effectiveMin,
+        },
       },
-    });
+      { idempotencyKey: hash }
+    );
 
-    // Record side effects only after successful persist
     this.sessionEntries.set(sessionKey, count + 1);
     this.dedup.add(hash, this.config.deduplicationWindowMinutes);
 
@@ -267,12 +268,10 @@ export class AutoMemoryMiddleware {
     const confidence = result.data.confidence;
     const tags = normalizeTags(result.data.tags);
 
-    // Atomic post-condition: never trust model importance below hard floor
     if (confidence < CONFIDENCE_HARD_FLOOR) {
       isImportant = false;
     }
 
-    // Important claims with zero usable tags are not retrieval-safe
     if (isImportant && tags.length === 0) {
       isImportant = false;
     }
@@ -304,7 +303,11 @@ export class AutoMemoryMiddleware {
     source: MemorySource
   ): Promise<void> {
     const brain = getBrainClient();
-    await brain.save({ type, content, tags: normalizeTags(tags), source });
+    const key = contentHash(`${type}\n${content}\n${tags.join(',')}`);
+    await brain.save(
+      { type, content, tags: normalizeTags(tags), source },
+      { idempotencyKey: key }
+    );
   }
 
   updateConfig(config: Partial<AutoMemoryConfig>): void {
