@@ -128,9 +128,9 @@ function parseFlags(args: string[]): {
   return { positional, flags, duplicates };
 }
 
-function positiveNumber(value: string | true | undefined, fallback: number): number | null {
+function positiveNumber(value: string | boolean | undefined, fallback: number): number | null {
   if (value === undefined) return fallback;
-  if (value === true) return null;
+  if (typeof value === 'boolean') return null;
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }
