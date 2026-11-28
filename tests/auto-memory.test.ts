@@ -104,7 +104,7 @@ describe('AutoMemoryMiddleware analysis tag boundary', () => {
     global.fetch = fetchMock as unknown as typeof fetch;
     const request = 'sqlite-invalid-tags-' + label;
     const response = 'response';
-    const hash = contentHash(request + '\\n---\\n' + response);
+    const hash = contentHash(request + '\n---\n' + response);
 
     try {
       await expect(mw.processInteraction(request, response, { tool: 'manual' }))
