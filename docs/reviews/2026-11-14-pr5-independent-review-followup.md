@@ -13,7 +13,7 @@
 
 Claude returned **REQUEST CHANGES**.
 
-The High finding PR5-H1 was that every failure after transition to UNKNOWN retained a permanent quarantine, including transport errors proving that no HTTP request was dispatched. Claude reproduced this with ECONNREFUSED and found no owner-safe resolution path.
+The High finding PR5-H1 was that every failure after transition to UNKNOWN retained a permanent quarantine, including transport errors proving that no HTTP request was dispatched. Correction to the initial reproduction record: Claude later identified that its first probe used port 1, which Fetch rejects as a bad port; that probe did not establish a genuine ECONNREFUSED. The underlying H1 concern remained valid for ambiguous HTTP/connection failures. A genuine ECONNREFUSED was subsequently reproduced against a just-closed loopback port and verified across Node 22, 24, and 26 by the real-socket regression test added in PR #10.
 
 Other findings:
 - M1: committed deduplication is windowed; after expiry, a repeated hash can be saved again; README described stale behavior.
