@@ -565,7 +565,7 @@ describe('pre-dispatch transport recovery', () => {
 });
 
 describe('Auto-Memory producer contract', () => {
-  it.each([[], [' '], ['\\t']])(
+  it.each([[], [' '], ['\t']])(
     'does not dispatch a Brain POST when model tags are invalid (%#)',
     async (tags) => {
       const mw = new AutoMemoryMiddleware(
