@@ -606,6 +606,95 @@ describe('SQLite busy-lock behavior', () => {
   }, 10_000);
 });
 
+
+describe('SQLite busy-lock Middleware integration', () => {
+  it('does not dispatch a Brain POST when the initial SQLite claim fails with SQLITE_BUSY', async () => {
+    const store = createDedupStore(dbPath, { requireSqlite: true });
+    const Database = require('better-sqlite3') as new (path: string) => {
+      exec(sql: string): void;
+      close(): void;
+    };
+    const blocker = new Database(dbPath);
+    const middleware = makeMw(store);
+    const fetchMock = vi.fn();
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const hash = contentHash('busy claim request\n---\nbusy claim response');
+
+    blocker.exec('BEGIN EXCLUSIVE');
+    try {
+      await expect(middleware.processInteraction('busy claim request', 'busy claim response', SRC))
+        .rejects.toThrow(/SQLITE_BUSY|database is locked/i);
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      blocker.exec('ROLLBACK');
+      blocker.close();
+    }
+
+    try {
+      expect(store.status(hash)).toBeNull();
+      expect(store.claim(hash, 1)).toEqual(expect.any(String));
+    } finally {
+      middleware.close();
+    }
+  }, 10_000);
+
+  it('does not dispatch a Brain POST when markUnknown fails with SQLITE_BUSY after analysis', async () => {
+    const store = createDedupStore(dbPath, { requireSqlite: true });
+    const Database = require('better-sqlite3') as new (path: string) => {
+      exec(sql: string): void;
+      close(): void;
+    };
+    const blocker = new Database(dbPath);
+    const middleware = makeMw(store);
+    const fetchMock = vi.fn();
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    let signalAnalysisStarted!: () => void;
+    const analysisStarted = new Promise<void>((resolve) => {
+      signalAnalysisStarted = resolve;
+    });
+    let releaseAnalysis!: () => void;
+    const analysisGate = new Promise<void>((resolve) => {
+      releaseAnalysis = resolve;
+    });
+    vi.spyOn(middleware as any, 'analyzeImportance').mockImplementation(async () => {
+      signalAnalysisStarted();
+      await analysisGate;
+      return analysis;
+    });
+
+    const hash = contentHash('busy markUnknown request\n---\nbusy markUnknown response');
+    const operation = middleware.processInteraction(
+      'busy markUnknown request',
+      'busy markUnknown response',
+      SRC
+    );
+
+    await analysisStarted;
+    blocker.exec('BEGIN EXCLUSIVE');
+    releaseAnalysis();
+
+    try {
+      await expect(operation).rejects.toThrow(/SQLITE_BUSY|database is locked/i);
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      blocker.exec('ROLLBACK');
+      blocker.close();
+    }
+
+    try {
+      // The failed release was fail-closed while the lock was held; the pending
+      // reservation becomes recoverable only after its bounded lease expires.
+      expect(store.status(hash)).toBe('pending');
+      advance(middleware.getStatus().effectiveLeaseMs + 1);
+      expect(store.status(hash)).toBeNull();
+      expect(store.claim(hash, 1)).toEqual(expect.any(String));
+    } finally {
+      middleware.close();
+    }
+  }, 10_000);
+});
+
 describe('SQLite multi-process atomicity', () => {
   it('allows exactly one independent Node process to claim the same hash', async () => {
     // Initialize schema before racing so this test isolates claim atomicity, not DDL startup.
