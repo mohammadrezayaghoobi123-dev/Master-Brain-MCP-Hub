@@ -8,7 +8,7 @@ import { toStructuredError } from '../lib/errors.js';
 export const saveSchema = z.object({
   content: z.string().min(1).max(10_000).describe('Der zu speichernde Inhalt'),
   type: z.enum(MEMORY_TYPES).describe('Art des Eintrags'),
-  tags: z.array(z.string()).min(1).max(10).describe('Tags für die Suche (1-10)'),
+  tags: z.array(z.string().trim().min(1)).min(1).max(10).describe('Tags für die Suche (1-10)'),
   summary: z.string().max(200).optional().describe('Kurze Zusammenfassung'),
   project: z.string().optional().describe('Projekt-Name'),
 });
