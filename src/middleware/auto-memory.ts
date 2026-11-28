@@ -31,7 +31,7 @@ const analysisSchema = z.object({
   isImportant: z.boolean(),
   type: z.enum(MEMORY_TYPES),
   summary: z.string().min(1).max(200),
-  tags: z.array(z.string().min(1).max(64)).max(5),
+  tags: z.array(z.string().min(1).max(64)).min(1).max(5),
   confidence: z.number().min(0).max(1),
   context: z.string().max(500).optional(),
 });
