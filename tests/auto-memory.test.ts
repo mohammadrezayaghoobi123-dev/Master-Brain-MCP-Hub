@@ -20,6 +20,108 @@ function memoryDedup(): DedupStore {
   return createMemoryDedupStore();
 }
 
+
+describe('AutoMemoryMiddleware analysis tag boundary', () => {
+  function installAnalyzer(mw: AutoMemoryMiddleware, tags: string[]) {
+    const create = vi.fn().mockResolvedValue({
+      id: 'msg_test',
+      type: 'message',
+      role: 'assistant',
+      model: 'test-model',
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          isImportant: true,
+          type: 'decision',
+          summary: 'A durable decision',
+          tags,
+          confidence: 1,
+        }),
+      }],
+      stop_reason: 'end_turn',
+      stop_sequence: null,
+      usage: { input_tokens: 1, output_tokens: 1 },
+    });
+    vi.spyOn(mw as any, 'getAnthropic').mockReturnValue({ messages: { create } });
+    return create;
+  }
+
+  it.each([
+    ['empty tag list', []],
+    ['whitespace-only tag', ['   ']],
+  ])('does not dispatch a Brain write for %s', async (label, tags) => {
+    const dedup = memoryDedup();
+    const mw = new AutoMemoryMiddleware({ enabled: true, minConfidence: 0.7 }, dedup);
+    installAnalyzer(mw, tags);
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 201,
+      json: async () => ({
+        id: '123e4567-e89b-42d3-a456-426614174000',
+        type: 'decision',
+        content: 'A durable decision',
+        tags: ['backend-valid'],
+        timestamp: '2026-11-25T00:00:00.000Z',
+        source: { tool: 'manual' },
+      }),
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const request = 'invalid-tags-' + label;
+    const response = 'response';
+    const hash = contentHash(request + '\n---\n' + response);
+
+    try {
+      await expect(mw.processInteraction(request, response, { tool: 'manual' }))
+        .resolves.toMatchObject({ saved: false, reason: 'below_threshold' });
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(dedup.status(hash)).toBeNull();
+    } finally {
+      mw.close();
+    }
+  });
+
+  it('trims and lowercases valid tags before the Brain write', async () => {
+    const dedup = memoryDedup();
+    const mw = new AutoMemoryMiddleware({ enabled: true, minConfidence: 0.7 }, dedup);
+    installAnalyzer(mw, ['  Decision ', ' FOLLOW-UP  ']);
+    let sentTags: string[] | undefined;
+    const fetchMock = vi.fn().mockImplementation(async (_url: unknown, init: RequestInit) => {
+      const sent = JSON.parse(String(init.body)) as {
+        type: string;
+        content: string;
+        tags: string[];
+        source: { tool: string };
+      };
+      sentTags = sent.tags;
+      return {
+        ok: true,
+        status: 201,
+        json: async () => ({
+          id: '123e4567-e89b-42d3-a456-426614174000',
+          type: sent.type,
+          content: sent.content,
+          tags: sent.tags,
+          timestamp: '2026-11-25T00:00:00.000Z',
+          source: sent.source,
+        }),
+      };
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const request = 'valid-tags';
+    const response = 'response';
+    const hash = contentHash(request + '\n---\n' + response);
+
+    try {
+      await expect(mw.processInteraction(request, response, { tool: 'manual' }))
+        .resolves.toMatchObject({ saved: true });
+      expect(sentTags).toEqual(['decision', 'follow-up']);
+      expect(dedup.status(hash)).toBe('committed');
+    } finally {
+      mw.close();
+    }
+  });
+});
+
 describe('AutoMemoryMiddleware', () => {
   let mw: AutoMemoryMiddleware;
 
