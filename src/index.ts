@@ -67,28 +67,28 @@ const tools = [
   observeToolDefinition,
   {
     name: 'brain_health',
-    description: 'Prüft ob das Master Brain erreichbar ist',
+    description: 'Check whether Master Brain backend is reachable (structured failure reasons)',
     inputSchema: { type: 'object', properties: {}, required: [] as string[] },
   },
   {
     name: 'auto_memory_status',
-    description: 'Zeigt Status der Auto-Memory Middleware',
+    description: 'Show Auto-Memory middleware status including effective confidence floor',
     inputSchema: { type: 'object', properties: {}, required: [] as string[] },
   },
   {
     name: 'auto_memory_config',
-    description: 'Konfiguriert die Auto-Memory Middleware (runtime, non-persistent)',
+    description: 'Configure Auto-Memory middleware (runtime, non-persistent)',
     inputSchema: {
       type: 'object',
       properties: {
-        enabled: { type: 'boolean', description: 'Auto-Memory aktivieren/deaktivieren' },
+        enabled: { type: 'boolean', description: 'Enable/disable Auto-Memory' },
         minConfidence: {
           type: 'number',
-          description: 'Min. Confidence zum Speichern (0-1)',
+          description: 'Min confidence to persist (0-1); enforced max with hard floor 0.75',
         },
         maxEntriesPerSession: {
           type: 'number',
-          description: 'Max. Auto-Saves pro Session',
+          description: 'Max auto-saves per session',
         },
       },
     },
@@ -158,7 +158,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           success: true,
           data: {
             brainConnected: health.ok,
-            version: health.version,
+            version: health.ok ? health.version : undefined,
+            reason: health.ok ? undefined : health.reason,
+            status: health.ok ? undefined : health.status,
+            message: health.ok ? undefined : health.message,
             mcpVersion: VERSION,
           },
         });
@@ -177,8 +180,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return toolResult({
           success: true,
           data: {
-            message: 'Konfiguration aktualisiert (runtime only)',
-            config: autoMemory.getStatus().config,
+            message: 'Configuration updated (runtime only)',
+            status: autoMemory.getStatus(),
           },
         });
       }
@@ -209,14 +212,14 @@ async function main() {
     console.error(`[Master Brain MCP Hub] Connected to Brain (v${health.version})`);
   } else {
     console.error(
-      '[Master Brain MCP Hub] WARNING: Brain not reachable at BRAIN_API_URL — tools will fail until it is up'
+      `[Master Brain MCP Hub] WARNING: Brain not reachable (${health.reason}${health.message ? `: ${health.message}` : ''}) — tools will fail until it is up`
     );
   }
 
   const autoMemory = getAutoMemory();
   const status = autoMemory.getStatus();
   console.error(
-    `[Master Brain MCP Hub] Auto-Memory: ${status.config.enabled ? 'enabled' : 'disabled'} (model=${status.config.analysisModel})`
+    `[Master Brain MCP Hub] Auto-Memory: ${status.config.enabled ? 'enabled' : 'disabled'} (model=${status.config.analysisModel}, effectiveMin=${status.effectiveMinConfidence})`
   );
   console.error(
     '[Master Brain MCP Hub] NOTE: Auto-Memory is explicit — use tool brain_observe from hooks/agents'
