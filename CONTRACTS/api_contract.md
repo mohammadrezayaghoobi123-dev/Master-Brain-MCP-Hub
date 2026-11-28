@@ -59,7 +59,7 @@ For `POST /api/brain/entries`, only **200** and **201** are documented success s
 ```json
 {
   "type": "decision|fix|learning|pattern|preference|config|error|context|conversation",
-  "content": "string (1–10000 characters)",
+  "content": "string (max 10000 characters; no minimum specified)",
   "summary": "string (optional, max 200 characters)",
   "tags": ["1–10 non-empty strings"],
   "source": {
