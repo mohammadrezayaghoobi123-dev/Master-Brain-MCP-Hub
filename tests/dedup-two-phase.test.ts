@@ -606,6 +606,95 @@ describe('SQLite busy-lock behavior', () => {
   }, 10_000);
 });
 
+
+describe('SQLite busy-lock Middleware integration', () => {
+  it('does not dispatch a Brain POST when the initial SQLite claim fails with SQLITE_BUSY', async () => {
+    const store = createDedupStore(dbPath, { requireSqlite: true });
+    const Database = require('better-sqlite3') as new (path: string) => {
+      exec(sql: string): void;
+      close(): void;
+    };
+    const blocker = new Database(dbPath);
+    const middleware = makeMw(store);
+    const fetchMock = vi.fn();
+    global.fetch = fetchMock as unknown as typeof fetch;
+    const hash = contentHash('busy claim request\n---\nbusy claim response');
+
+    blocker.exec('BEGIN EXCLUSIVE');
+    try {
+      await expect(middleware.processInteraction('busy claim request', 'busy claim response', SRC))
+        .rejects.toThrow(/SQLITE_BUSY|database is locked/i);
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      blocker.exec('ROLLBACK');
+      blocker.close();
+    }
+
+    try {
+      expect(store.status(hash)).toBeNull();
+      expect(store.claim(hash, 1)).toEqual(expect.any(String));
+    } finally {
+      middleware.close();
+    }
+  }, 10_000);
+
+  it('does not dispatch a Brain POST when markUnknown fails with SQLITE_BUSY after analysis', async () => {
+    const store = createDedupStore(dbPath, { requireSqlite: true });
+    const Database = require('better-sqlite3') as new (path: string) => {
+      exec(sql: string): void;
+      close(): void;
+    };
+    const blocker = new Database(dbPath);
+    const middleware = makeMw(store);
+    const fetchMock = vi.fn();
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    let signalAnalysisStarted!: () => void;
+    const analysisStarted = new Promise<void>((resolve) => {
+      signalAnalysisStarted = resolve;
+    });
+    let releaseAnalysis!: () => void;
+    const analysisGate = new Promise<void>((resolve) => {
+      releaseAnalysis = resolve;
+    });
+    vi.spyOn(middleware as any, 'analyzeImportance').mockImplementation(async () => {
+      signalAnalysisStarted();
+      await analysisGate;
+      return analysis;
+    });
+
+    const hash = contentHash('busy markUnknown request\n---\nbusy markUnknown response');
+    const operation = middleware.processInteraction(
+      'busy markUnknown request',
+      'busy markUnknown response',
+      SRC
+    );
+
+    await analysisStarted;
+    blocker.exec('BEGIN EXCLUSIVE');
+    releaseAnalysis();
+
+    try {
+      await expect(operation).rejects.toThrow(/SQLITE_BUSY|database is locked/i);
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      blocker.exec('ROLLBACK');
+      blocker.close();
+    }
+
+    try {
+      // The failed release was fail-closed while the lock was held; the pending
+      // reservation becomes recoverable only after its bounded lease expires.
+      expect(store.status(hash)).toBe('pending');
+      advance(middleware.getStatus().effectiveLeaseMs + 1);
+      expect(store.status(hash)).toBeNull();
+      expect(store.claim(hash, 1)).toEqual(expect.any(String));
+    } finally {
+      middleware.close();
+    }
+  }, 10_000);
+});
+
 describe('SQLite multi-process atomicity', () => {
   it('allows exactly one independent Node process to claim the same hash', async () => {
     // Initialize schema before racing so this test isolates claim atomicity, not DDL startup.
@@ -625,9 +714,20 @@ describe('SQLite multi-process atomicity', () => {
         store.close();
         process.exitCode = 2;
       } else {
-        const token = store.claim('cross-process-hash', 5);
-        process.stdout.write('RESULT:' + (token === null ? 'null' : token) + '\\n');
-        store.close();
+        try {
+          const token = store.claim('cross-process-hash', 5);
+          process.stdout.write('RESULT:' + (token === null ? 'null' : token) + '\\n');
+        } catch (error) {
+          // Bounded SQLite lock contention is a documented fail-closed outcome.
+          // Treat SQLITE_BUSY as blocked, not as a second owner or a test crash.
+          if (error && typeof error === 'object' && 'code' in error && error.code === 'SQLITE_BUSY') {
+            process.stdout.write('RESULT:busy\\n');
+          } else {
+            throw error;
+          }
+        } finally {
+          store.close();
+        }
       }
     `;
 
@@ -642,13 +742,13 @@ describe('SQLite multi-process atomicity', () => {
       let ready = false;
       let resolveReady!: () => void;
       let rejectReady!: (error: Error) => void;
-      let resolveResult!: (value: string | null) => void;
+      let resolveResult!: (value: string | null | 'busy') => void;
       let rejectResult!: (error: Error) => void;
       const readyPromise = new Promise<void>((resolve, reject) => {
         resolveReady = resolve;
         rejectReady = reject;
       });
-      const resultPromise = new Promise<string | null>((resolve, reject) => {
+      const resultPromise = new Promise<string | null | 'busy'>((resolve, reject) => {
         resolveResult = resolve;
         rejectResult = reject;
       });
@@ -661,7 +761,10 @@ describe('SQLite multi-process atomicity', () => {
           resolveReady();
         }
         const resultLine = lines.find((line) => line.startsWith('RESULT:'));
-        if (resultLine) resolveResult(resultLine.slice('RESULT:'.length) === 'null' ? null : resultLine.slice('RESULT:'.length));
+        if (resultLine) {
+          const value = resultLine.slice('RESULT:'.length);
+          resolveResult(value === 'null' ? null : value === 'busy' ? 'busy' : value);
+        }
       });
       child.stderr.setEncoding('utf8').on('data', (chunk: string) => (stderr += chunk));
       child.once('error', (error) => {
@@ -691,8 +794,10 @@ describe('SQLite multi-process atomicity', () => {
       for (const worker of workers) worker.child.stdin.write('GO\n');
 
       const results = await Promise.all(workers.map((worker) => worker.resultPromise));
-      expect(results.filter((token) => token !== null)).toHaveLength(1);
-      expect(results.filter((token) => token === null)).toHaveLength(1);
+      const owners = results.filter((token) => token !== null && token !== 'busy');
+      const blocked = results.filter((token) => token === null || token === 'busy');
+      expect(owners).toHaveLength(1);
+      expect(blocked).toHaveLength(1);
 
       const verification = createDedupStore(dbPath);
       try {
