@@ -112,7 +112,16 @@ export class BrainClient {
         signal: controller.signal,
       });
 
-      if (!response.ok) {
+      // POST /entries is contractually successful only for 200 or 201.
+      // A generic Fetch response.ok check also accepts 202 (accepted, not
+      // necessarily persisted) and 204 (no representation to validate).
+      const method = (options.method ?? 'GET').toUpperCase();
+      const acceptedStatus =
+        method === 'POST'
+          ? response.status === 200 || response.status === 201
+          : response.ok;
+
+      if (!acceptedStatus) {
         let body: Record<string, unknown> = {};
         try {
           body = (await response.json()) as Record<string, unknown>;
