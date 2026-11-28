@@ -1,0 +1,86 @@
+[
+  {
+    "id": "decision-auth-strategy",
+    "expectedImportant": true,
+    "expectedType": "decision",
+    "request": "Should we use JWT or session cookies for the MCP hub auth?",
+    "response": "Decision: use short-lived bearer tokens (JWT) with server-side revocation list. Session cookies rejected because stdio and multi-client agents cannot share cookie jars reliably. Documented in ADR-012."
+  },
+  {
+    "id": "fix-sqlite-busy",
+    "expectedImportant": true,
+    "expectedType": "fix",
+    "request": "better-sqlite3 throws SQLITE_BUSY under concurrent observe calls",
+    "response": "Root cause: default busy_timeout was 0. Fix: set pragma busy_timeout=5000 and serialize writes through a single queue. Confirmed under 20 parallel processInteraction calls."
+  },
+  {
+    "id": "learning-idempotency",
+    "expectedImportant": true,
+    "expectedType": "learning",
+    "request": "What did we learn from the double-save incident last week?",
+    "response": "Learning: client-side dedup is not enough under retries after timeout. Always send Idempotency-Key and treat UNKNOWN as retry-same-key, never mint a new key."
+  },
+  {
+    "id": "pattern-observe-hook",
+    "expectedImportant": true,
+    "expectedType": "pattern",
+    "request": "How should agents call auto-memory?",
+    "response": "Pattern: call brain_observe from SessionEnd hook and after verified fixes only. Do not observe every turn — noise destroys retrieval quality."
+  },
+  {
+    "id": "preference-language",
+    "expectedImportant": true,
+    "expectedType": "preference",
+    "request": "I prefer all classifier prompts in English and summaries under 180 chars.",
+    "response": "Noted. Stable preference recorded for this user/project."
+  },
+  {
+    "id": "config-model",
+    "expectedImportant": true,
+    "expectedType": "config",
+    "request": "Set AUTO_MEMORY_MODEL to claude-3-5-haiku and min confidence 0.75",
+    "response": "Configuration applied: analysisModel=claude-3-5-haiku-20241022, effective min confidence max(config, 0.75 hard floor)."
+  },
+  {
+    "id": "error-mode-rate-limit",
+    "expectedImportant": true,
+    "expectedType": "error",
+    "request": "Brain save keeps returning 429",
+    "response": "Actionable error mode: BRAIN_HTTP 429 RATE_LIMITED. Back off exponentially, respect Retry-After, and do not open new sessions until window clears."
+  },
+  {
+    "id": "reject-smalltalk",
+    "expectedImportant": false,
+    "expectedType": "conversation",
+    "request": "thanks, that worked",
+    "response": "You're welcome! Happy to help."
+  },
+  {
+    "id": "reject-status",
+    "expectedImportant": false,
+    "expectedType": "context",
+    "request": "are you online?",
+    "response": "Yes, Master Brain MCP Hub is running."
+  },
+  {
+    "id": "reject-oneoff",
+    "expectedImportant": false,
+    "expectedType": "context",
+    "request": "what is 2+2?",
+    "response": "4"
+  },
+  {
+    "id": "reject-transient-debug",
+    "expectedImportant": false,
+    "expectedType": "context",
+    "request": "print the current env BRAIN_API_URL",
+    "response": "BRAIN_API_URL=http://localhost:3001"
+  },
+  {
+    "id": "reject-speculation",
+    "expectedImportant": false,
+    "expectedType": "context",
+    "request": "maybe we should rewrite everything in Rust someday?",
+    "response": "Possibly, but no decision or plan was made. Pure speculation."
+  }
+]
