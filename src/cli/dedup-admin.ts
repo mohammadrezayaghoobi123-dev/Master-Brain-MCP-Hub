@@ -44,9 +44,9 @@ const USAGE = [
   '  dedup-admin audit [--limit N]',
 ].join('\n');
 
-function parseFlags(args: string[]): { positional: string[]; flags: Map<string, string | true> } {
+function parseFlags(args: string[]): { positional: string[]; flags: Map<string, string | boolean> } {
   const positional: string[] = [];
-  const flags = new Map<string, string | true>();
+  const flags = new Map<string, string | boolean>();
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
     if (!arg.startsWith('--')) {
@@ -55,7 +55,20 @@ function parseFlags(args: string[]): { positional: string[]; flags: Map<string, 
     }
     const name = arg.slice(2);
     const next = args[i + 1];
-    if (name === 'yes' || next === undefined || next.startsWith('--')) {
+
+    // --yes is a boolean flag: support its bare form and explicit true/false values.
+    // Never reinterpret an explicit false value as affirmative confirmation.
+    if (name === 'yes') {
+      if (next === 'true' || next === 'false') {
+        flags.set(name, next === 'true');
+        i += 1;
+      } else {
+        flags.set(name, true);
+      }
+      continue;
+    }
+
+    if (next === undefined || next.startsWith('--')) {
       flags.set(name, true);
     } else {
       flags.set(name, next);
@@ -65,9 +78,9 @@ function parseFlags(args: string[]): { positional: string[]; flags: Map<string, 
   return { positional, flags };
 }
 
-function positiveNumber(value: string | true | undefined, fallback: number): number | null {
+function positiveNumber(value: string | boolean | undefined, fallback: number): number | null {
   if (value === undefined) return fallback;
-  if (value === true) return null;
+  if (typeof value === 'boolean') return null;
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }
@@ -98,6 +111,20 @@ export function runCli(argv: string[], options: CliOptions = {}): number {
       }
     }
     const { positional, flags } = parseFlags(rest);
+    const allowedFlags =
+      command === 'resolve'
+        ? new Set(['outcome', 'ttl-minutes', 'min-age-minutes', 'note', 'yes'])
+        : command === 'audit'
+          ? new Set(['limit'])
+          : new Set<string>();
+    const expectedPositionals = command === 'resolve' ? 1 : 0;
+    if (
+      positional.length !== expectedPositionals ||
+      [...flags.keys()].some((name) => !allowedFlags.has(name))
+    ) {
+      io.err(USAGE);
+      return EXIT_USAGE;
+    }
 
     if (command === 'list') {
       const rows = store.listUnknown(1000);
