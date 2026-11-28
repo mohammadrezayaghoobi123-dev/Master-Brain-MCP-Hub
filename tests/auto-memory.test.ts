@@ -538,6 +538,51 @@ describe('pre-dispatch transport recovery', () => {
     }
   });
 
+  it('reverts the matching UNKNOWN claim after EAI_AGAIN and allows one successful retry', async () => {
+    const dedup = memoryDedup();
+    const mw = new AutoMemoryMiddleware({ enabled: true, minConfidence: 0.7 }, dedup);
+    vi.spyOn(mw as any, 'analyzeImportance').mockResolvedValue(analysis);
+    _resetBrainClientForTests();
+
+    const dnsFailure = Object.assign(new Error('temporary name resolution failure'), {
+      code: 'EAI_AGAIN',
+    });
+    const fetchFailure = Object.assign(new TypeError('fetch failed'), { cause: dnsFailure });
+    const savedEntry = {
+      id: '123e4567-e89b-42d3-a456-426614174000',
+      type: 'decision',
+      content: analysis.summary,
+      tags: analysis.tags,
+      timestamp: new Date().toISOString(),
+      source: { tool: 'manual' },
+    };
+    global.fetch = vi.fn()
+      .mockRejectedValueOnce(fetchFailure)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 201,
+        json: async () => savedEntry,
+      }) as unknown as typeof fetch;
+
+    const hash = contentHash('eai-again request\\n---\\nresponse');
+    try {
+      await expect(mw.processInteraction('eai-again request', 'response', { tool: 'manual' }))
+        .rejects.toMatchObject({
+          code: 'BRAIN_UNREACHABLE',
+          details: { networkCode: 'EAI_AGAIN', requestDisposition: 'not_dispatched' },
+        });
+      expect(dedup.status(hash)).toBeNull();
+
+      await expect(mw.processInteraction('eai-again request', 'response', { tool: 'manual' }))
+        .resolves.toMatchObject({ saved: true });
+      expect(global.fetch).toHaveBeenCalledTimes(2);
+      expect(dedup.status(hash)).toBe('committed');
+    } finally {
+      mw.close();
+      _resetBrainClientForTests();
+    }
+  });
+
   it('does not reopen retry after ECONNRESET because dispatch may already have happened', async () => {
     const dedup = memoryDedup();
     const mw = new AutoMemoryMiddleware({ enabled: true, minConfidence: 0.7 }, dedup);
