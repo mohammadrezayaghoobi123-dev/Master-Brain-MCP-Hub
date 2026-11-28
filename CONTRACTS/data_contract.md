@@ -3,7 +3,7 @@
 > **RULE:** No silent changes to types or fields.
 > Changes require: `CHANGE AUTHORIZED: ...`
 
-**Version:** 1.4.0  
+**Version:** 1.4.1  
 **Last updated:** 2026-11-28
 
 ---
@@ -75,7 +75,6 @@ CREATE TABLE unknown_resolutions (
 );
 ```
 
-The database path is configured explicitly (production requires a persistent SQLite path); the conventional location is `$DATA_DIR/.data/auto-memory-dedup.sqlite`.
 This contract covers the Hub-local deduplication store only; it does not specify the external Brain Backend's internal storage schema or prove deployed-backend conformance.
 
 SQLite path selection:
@@ -88,17 +87,9 @@ SQLite path selection:
 ### Migration and SQLite contention policy
 
 - Additive schema and index migrations run inside one `BEGIN IMMEDIATE` / `COMMIT` transaction. If any DDL step fails, the migration attempts `ROLLBACK`, closes the native SQLite handle, and rethrows the original error; partial schema upgrades are not accepted.
-- The production `better-sqlite3` busy timeout is bounded at **100 ms** to avoid a multi-second synchronous event-loop stall. `SQLITE_BUSY` is surfaced as an operation failure; the Hub fails closed and does not dispatch a Brain POST unless the pending-to-UNKNOWN transition has been confirmed.
+- The `better-sqlite3` busy timeout is bounded at **100 ms** to avoid a multi-second synchronous event-loop stall. `SQLITE_BUSY` is surfaced as an operation failure; the Hub fails closed and does not dispatch a Brain POST unless the pending-to-UNKNOWN transition has been confirmed.
 - A lock timeout is not evidence that an external Brain write was absent. Dispatched or otherwise ambiguous writes remain in UNKNOWN; no automatic retry or exactly-once claim follows from the local SQLite state machine.
 
-This contract covers the Hub-local deduplication store only; it does not specify the external Brain Backend's internal storage schema or prove deployed-backend conformance.
-
-SQLite path selection:
-- `DEDUP_DB_PATH`: explicit database-file path.
-- `DATA_DIR`: database path is `$DATA_DIR/.data/auto-memory-dedup.sqlite`.
-- Outside production, absent configuration may use `.data/auto-memory-dedup.sqlite` under the current working directory.
-- In production, an absolute persistent path is mandatory; CWD-dependent paths are rejected.
-- Production and `DEDUP_REQUIRE_SQLITE=1|true` fail closed if SQLite is unavailable. In-memory fallback is non-durable and has no cross-process coordination.
 
 
 ### State semantics and invariants
@@ -143,3 +134,4 @@ This store is **not** the Brain database; it coordinates duplicate auto-saves on
 | 2026-11-14 | Aligned dedup schema, UNKNOWN quarantine, owner-checked transitions, operator resolution, and audit semantics with PR17 | explicit user authorization |
 | 2026-11-23 | Aligned schema and operator-resolution contract with PR20, including per-entry in-flight deadlines and legacy-row handling | explicit user authorization |
 | 2026-11-28 | Reconciled BrainEntry tag requirements, migration atomicity, bounded SQLite contention, and the P11 operator safeguards with the integrated Hub implementation | project owner (whole-project integration instruction) |
+| 2026-11-28 | Removed duplicated SQLite path/backend boundary sections and corrected the busy-timeout scope to match the implementation | project owner (whole-project integration instruction) |
