@@ -171,7 +171,7 @@ class SqliteDedupStore implements DedupStore {
   constructor(dbPath: string, loadDriver: () => unknown = () => require('better-sqlite3')) {
     const Database = loadDriver() as new (
       path: string,
-      opts?: { readonly?: boolean }
+      opts?: { readonly?: boolean; timeout?: number }
     ) => {
       exec(sql: string): void;
       prepare(sql: string): {
@@ -182,7 +182,9 @@ class SqliteDedupStore implements DedupStore {
     };
 
     mkdirSync(dirname(dbPath), { recursive: true });
-    this.db = new Database(dbPath);
+    // better-sqlite3 defaults to a 5s synchronous busy wait, which can stall the Node event loop.
+    // Bound lock contention to 100ms; callers fail closed on SQLITE_BUSY and may retry at the operation boundary.
+    this.db = new Database(dbPath, { timeout: 100 });
     try {
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS content_hashes (
