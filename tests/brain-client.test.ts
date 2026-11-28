@@ -54,6 +54,7 @@ describe('BrainClient — API calls', () => {
   it('calls save endpoint', async () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
+      status: 201,
       json: async () => ({
         id: '123e4567-e89b-42d3-a456-426614174000',
         type: 'decision',
@@ -76,6 +77,28 @@ describe('BrainClient — API calls', () => {
       expect.objectContaining({ method: 'POST' })
     );
     expect(result.id).toBe('123e4567-e89b-42d3-a456-426614174000');
+  });
+
+  it.each([202, 204])('does not treat HTTP %i as a confirmed Brain save', async (status) => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      status,
+      json: async () => ({
+        id: '123e4567-e89b-42d3-a456-426614174000',
+        type: 'decision',
+        content: 'Test content',
+        tags: ['test'],
+        timestamp: new Date().toISOString(),
+        source: { tool: 'claude-code' },
+      }),
+    });
+
+    await expect(client.save({
+      type: 'decision',
+      content: 'Test content',
+      tags: ['test'],
+      source: { tool: 'claude-code' },
+    })).rejects.toMatchObject({ code: 'BRAIN_HTTP_ERROR' });
   });
 
   it.each([
