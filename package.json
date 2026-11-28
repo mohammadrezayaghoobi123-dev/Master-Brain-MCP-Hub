@@ -10,6 +10,8 @@
     "dev": "tsx watch src/index.ts",
     "test": "vitest",
     "test:run": "vitest run",
+    "test:eval": "vitest run tests/classification-metrics.test.ts tests/importance-eval.test.ts",
+    "test:eval:live": "RUN_LIVE_EVAL=1 vitest run tests/importance-eval.test.ts",
     "lint": "eslint src/",
     "typecheck": "tsc --noEmit"
   },
