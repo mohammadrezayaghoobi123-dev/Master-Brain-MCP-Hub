@@ -565,38 +565,41 @@ describe('pre-dispatch transport recovery', () => {
 });
 
 describe('Auto-Memory producer contract', () => {
-  it('does not dispatch a Brain POST when the model returns an empty tags array', async () => {
-    const mw = new AutoMemoryMiddleware(
-      { enabled: true, minConfidence: 0.7 },
-      memoryDedup()
-    );
-    const create = vi.fn().mockResolvedValue({
-      content: [{
-        type: 'text',
-        text: JSON.stringify({
-          isImportant: true,
-          type: 'decision',
-          summary: 'A durable decision without tags',
-          tags: [],
-          confidence: 1,
-        }),
-      }],
-    });
-    vi.spyOn(mw as any, 'getAnthropic').mockReturnValue({ messages: { create } });
-    const fetchMock = vi.fn();
-    global.fetch = fetchMock as unknown as typeof fetch;
-
-    try {
-      await expect(mw.processInteraction('empty-tags request', 'response', {
-        tool: 'manual',
-      })).resolves.toMatchObject({
-        saved: false,
-        reason: 'below_threshold',
+  it.each([[], [' '], ['\\t']])(
+    'does not dispatch a Brain POST when model tags are invalid (%#)',
+    async (tags) => {
+      const mw = new AutoMemoryMiddleware(
+        { enabled: true, minConfidence: 0.7 },
+        memoryDedup()
+      );
+      const create = vi.fn().mockResolvedValue({
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            isImportant: true,
+            type: 'decision',
+            summary: 'A durable decision with invalid tags',
+            tags,
+            confidence: 1,
+          }),
+        }],
       });
-      expect(create).toHaveBeenCalledTimes(1);
-      expect(fetchMock).not.toHaveBeenCalled();
-    } finally {
-      mw.close();
+      vi.spyOn(mw as any, 'getAnthropic').mockReturnValue({ messages: { create } });
+      const fetchMock = vi.fn();
+      global.fetch = fetchMock as unknown as typeof fetch;
+
+      try {
+        await expect(mw.processInteraction('invalid-tags request', 'response', {
+          tool: 'manual',
+        })).resolves.toMatchObject({
+          saved: false,
+          reason: 'below_threshold',
+        });
+        expect(create).toHaveBeenCalledTimes(1);
+        expect(fetchMock).not.toHaveBeenCalled();
+      } finally {
+        mw.close();
+      }
     }
-  });
+  );
 });
