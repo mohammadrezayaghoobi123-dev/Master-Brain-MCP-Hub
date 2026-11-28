@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { saveSchema } from '../src/tools/save.js';
+import { saveSchema, saveToolDefinition } from '../src/tools/save.js';
 
 describe('brain_save tag input boundary', () => {
   const validBase = {
@@ -31,5 +31,29 @@ describe('brain_save tag input boundary', () => {
       ...validBase,
       tags: ['valid', '   '],
     }).success).toBe(false);
+  });
+
+  it('publishes the same BrainEntry input bounds to MCP clients as runtime validation', () => {
+    const properties = saveToolDefinition.inputSchema.properties;
+
+    expect(properties.content).toMatchObject({
+      type: 'string',
+      minLength: 1,
+      maxLength: 10_000,
+    });
+    expect(properties.summary).toMatchObject({
+      type: 'string',
+      maxLength: 200,
+    });
+    expect(properties.tags).toMatchObject({
+      type: 'array',
+      minItems: 1,
+      maxItems: 10,
+    });
+    expect(properties.tags.items).toMatchObject({
+      type: 'string',
+      minLength: 1,
+      pattern: '\\S',
+    });
   });
 });

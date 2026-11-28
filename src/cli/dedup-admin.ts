@@ -197,8 +197,8 @@ export function runCli(argv: string[], options: CliOptions = {}): number {
 
     if (command === 'audit') {
       const limit = positiveNumber(flags.get('limit'), 50);
-      if (limit === null) {
-        io.err('--limit must be a positive number');
+      if (limit === null || !Number.isSafeInteger(limit)) {
+        io.err('--limit must be a positive integer');
         return EXIT_USAGE;
       }
       const records = store.listResolutions(limit);

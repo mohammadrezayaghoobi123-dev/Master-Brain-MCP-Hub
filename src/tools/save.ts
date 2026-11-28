@@ -53,7 +53,9 @@ export const saveToolDefinition = {
     properties: {
       content: {
         type: 'string',
-        description: 'Der zu speichernde Inhalt (max 10000 Zeichen)',
+        minLength: 1,
+        maxLength: 10_000,
+        description: 'Der zu speichernde Inhalt (1-10000 Zeichen)',
       },
       type: {
         type: 'string',
@@ -62,11 +64,18 @@ export const saveToolDefinition = {
       },
       tags: {
         type: 'array',
-        items: { type: 'string' },
-        description: 'Tags für spätere Suche (1-10 Tags)',
+        minItems: 1,
+        maxItems: 10,
+        items: {
+          type: 'string',
+          minLength: 1,
+          pattern: '\\S',
+        },
+        description: 'Tags für spätere Suche (1-10 nicht-leere Tags; Whitespace-only Werte sind ungültig)',
       },
       summary: {
         type: 'string',
+        maxLength: 200,
         description: 'Optionale Kurzzusammenfassung (max 200 Zeichen)',
       },
       project: {

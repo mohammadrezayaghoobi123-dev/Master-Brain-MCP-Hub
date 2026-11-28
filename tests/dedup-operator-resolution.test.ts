@@ -948,3 +948,18 @@ describe('R20 review nits (print-time sanitiser, age message)', () => {
     expect(err.join(' ').includes('2x BRAIN_TIMEOUT_MS')).toBe(true);
   });
 });
+
+describe('CLI numeric argument validation', () => {
+  it('rejects a fractional audit limit instead of silently falling back to the default limit', () => {
+    const store = createMemoryDedupStore();
+    try {
+      const code = runCli(
+        ['audit', '--limit', '1.5'],
+        { store, io: { out: () => undefined, err: () => undefined } }
+      );
+      expect(code).toBe(EXIT_USAGE);
+    } finally {
+      store.close();
+    }
+  });
+});
