@@ -300,6 +300,20 @@ describe('dedup-admin CLI', () => {
     expect(out.join('\n')).toContain('--yes');
   });
 
+  it('treats explicit --yes false as a dry run and preserves UNKNOWN plus audit state', () => {
+    const hash = hex(105);
+    quarantine(store, hash);
+    const code = runCli(
+      ['resolve', hash.slice(0, 12), '--outcome', 'not_stored', '--yes', 'false'],
+      { store, io, operator: 'dana', now: Date.now() + 60 * MIN }
+    );
+
+    expect(code).toBe(EXIT_CONFIRM);
+    expect(store.status(hash)).toBe('unknown');
+    expect(store.listResolutions()).toHaveLength(0);
+    expect(out.join('\\n')).toContain('Dry run only');
+  });
+
   it('resolve --yes applies, records the operator and the note, and audit prints it', () => {
     quarantine(store, hex(102));
     const code = runCli(
