@@ -48,7 +48,7 @@ function isBrainEntry(value: unknown): value is BrainEntry {
     !Array.isArray(value.tags) ||
     value.tags.length < 1 ||
     value.tags.length > 10 ||
-    !value.tags.every((tag) => typeof tag === 'string')
+    !value.tags.every((tag) => typeof tag === 'string' && tag.trim().length > 0)
   ) return false;
   if (!isRecord(value.source) || typeof value.source.tool !== 'string') return false;
   if (!MEMORY_SOURCE_TOOLS.has(value.source.tool)) return false;
