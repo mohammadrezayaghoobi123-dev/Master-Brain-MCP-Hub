@@ -7,10 +7,14 @@
 //   npm run dedup:admin -- list
 //   npm run dedup:admin -- resolve <hash-prefix> --outcome not_stored|stored [--yes]
 //   npm run dedup:admin -- audit [--limit N]
+import { realpathSync, statSync } from 'node:fs';
 import { userInfo } from 'node:os';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
+import { DEFAULT_BRAIN_TIMEOUT_MS, parsePositiveSafeIntegerEnv } from '../lib/time-budget.js';
 import {
   createDedupStore,
+  locateDedupDb,
+  sanitizeForDisplay,
   DEFAULT_RESOLVE_TTL_MINUTES,
   type DedupStore,
   type UnknownOutcome,
@@ -36,17 +40,62 @@ export const EXIT_CONFIRM = 3;
 
 const DEFAULT_MIN_AGE_MINUTES = 10;
 
+/**
+ * Oldest an UNKNOWN entry may be before an operator can resolve it: the larger of the fixed floor
+ * and twice the configured Brain timeout (+1s), so a request that is still legitimately in flight
+ * (or about to time out) can never be resolved as 'not stored'. Mirrors the budget the middleware
+ * persists with each entry; this covers rows written before that column existed.
+ */
+export function minResolveAgeMs(): number {
+  const timeoutMs = parsePositiveSafeIntegerEnv('BRAIN_TIMEOUT_MS', DEFAULT_BRAIN_TIMEOUT_MS);
+  return Math.max(DEFAULT_MIN_AGE_MINUTES * 60_000, timeoutMs * 2 + 1000);
+}
+
+function isNonEmptyFile(path: string): boolean {
+  try {
+    const st = statSync(path);
+    return st.isFile() && st.size > 0;
+  } catch {
+    return false;
+  }
+}
+
+/** True when this module is the process entrypoint, also through npm/.bin symlinks. */
+export function isEntrypoint(metaUrl: string, argv1: string | undefined): boolean {
+  if (argv1 === undefined) return false;
+  try {
+    return realpathSync(fileURLToPath(metaUrl)) === realpathSync(argv1);
+  } catch {
+    return false;
+  }
+}
+
 const USAGE = [
   'Usage:',
   '  dedup-admin list',
   '  dedup-admin resolve <hash-prefix> --outcome not_stored|stored [--note TEXT]',
-  `                      [--ttl-minutes N (stored only, default ${DEFAULT_RESOLVE_TTL_MINUTES})] [--yes]`,
+  `                      [--ttl-minutes N (REQUIRED for stored; must equal the Hub's dedup window, e.g. ${DEFAULT_RESOLVE_TTL_MINUTES})] [--yes]`,
+  `                      [--acknowledge-legacy-budget (entries from older Hubs; BRAIN_TIMEOUT_MS here must equal the Hub's)]`,
   '  dedup-admin audit [--limit N]',
 ].join('\n');
 
-function parseFlags(args: string[]): { positional: string[]; flags: Map<string, string | boolean> } {
+const REFUSAL_TEXT: Record<string, string> = {
+  invalid_prefix: 'The hash prefix must be 8-64 hexadecimal characters.',
+  not_found: 'No UNKNOWN entry matches that prefix (it may already be resolved).',
+  ambiguous: 'More than one UNKNOWN entry matches; use a longer prefix.',
+  too_recent: 'The entry was quarantined too recently; a request may still be in flight.',
+  in_flight: "The request's own timeout budget has not elapsed yet; it may still complete.",
+  missing_timestamp: 'The UNKNOWN entry has no quarantine timestamp; refusing to resolve corrupted or legacy state.',
+};
+
+function parseFlags(args: string[]): {
+  positional: string[];
+  flags: Map<string, string | boolean>;
+  duplicates: string[];
+} {
   const positional: string[] = [];
   const flags = new Map<string, string | boolean>();
+  const duplicates: string[] = [];
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
     if (!arg.startsWith('--')) {
@@ -55,10 +104,11 @@ function parseFlags(args: string[]): { positional: string[]; flags: Map<string, 
     }
     const name = arg.slice(2);
     const next = args[i + 1];
+    if (flags.has(name)) duplicates.push(name);
 
-    // --yes is a boolean flag: support its bare form and explicit true/false values.
-    // Never reinterpret an explicit false value as affirmative confirmation.
-    if (name === 'yes') {
+    // Confirmation and legacy-budget acknowledgement are boolean gates.
+    // A literal "false" must never be swallowed as an affirmative bare flag.
+    if (name === 'yes' || name === 'acknowledge-legacy-budget') {
       if (next === 'true' || next === 'false') {
         flags.set(name, next === 'true');
         i += 1;
@@ -75,7 +125,7 @@ function parseFlags(args: string[]): { positional: string[]; flags: Map<string, 
       i += 1;
     }
   }
-  return { positional, flags };
+  return { positional, flags, duplicates };
 }
 
 function positiveNumber(value: string | boolean | undefined, fallback: number): number | null {
@@ -104,22 +154,27 @@ export function runCli(argv: string[], options: CliOptions = {}): number {
   const ownsStore = store === undefined;
   try {
     if (!store) {
-      store = createDedupStore();
-      if (store.backend !== 'sqlite') {
-        io.err('No persistent SQLite dedup store is configured; there is nothing to resolve. Set DEDUP_DB_PATH or DATA_DIR.');
+      const location = locateDedupDb();
+      if (!isNonEmptyFile(location.path)) {
+        io.err(
+          `No dedup database (a non-empty file) at ${location.path}. Refusing to create one: set DEDUP_DB_PATH (or DATA_DIR) to the Hub's database.`
+        );
         return EXIT_REFUSED;
       }
+      store = createDedupStore(undefined, { requireSqlite: true });
+      io.out(`Dedup database: ${location.path}`);
     }
-    const { positional, flags } = parseFlags(rest);
+    const { positional, flags, duplicates } = parseFlags(rest);
     const allowedFlags =
       command === 'resolve'
-        ? new Set(['outcome', 'ttl-minutes', 'min-age-minutes', 'note', 'yes'])
+        ? new Set(['outcome', 'ttl-minutes', 'min-age-minutes', 'note', 'yes', 'acknowledge-legacy-budget'])
         : command === 'audit'
           ? new Set(['limit'])
           : new Set<string>();
     const expectedPositionals = command === 'resolve' ? 1 : 0;
     if (
       positional.length !== expectedPositionals ||
+      duplicates.length > 0 ||
       [...flags.keys()].some((name) => !allowedFlags.has(name))
     ) {
       io.err(USAGE);
@@ -149,7 +204,7 @@ export function runCli(argv: string[], options: CliOptions = {}): number {
       const records = store.listResolutions(limit);
       if (records.length === 0) io.out('No resolutions recorded.');
       for (const r of records) {
-        io.out(`${new Date(r.at).toISOString()}  ${r.hashPrefix}  ${r.outcome}  by ${r.operator}${r.note ? `  — ${r.note}` : ''}`);
+        io.out(`${new Date(r.at).toISOString()}  ${r.hashPrefix}  ${r.outcome}  by ${sanitizeForDisplay(r.operator)}${r.note ? `  — ${sanitizeForDisplay(r.note)}` : ''}`);
       }
       return EXIT_OK;
     }
@@ -161,19 +216,34 @@ export function runCli(argv: string[], options: CliOptions = {}): number {
       io.err(USAGE);
       return EXIT_USAGE;
     }
+    if (outcome === 'stored' && !flags.has('ttl-minutes')) {
+      io.err("--ttl-minutes is required for --outcome stored and must equal the Hub's dedup window (a wrong value shortens or extends duplicate protection)");
+      return EXIT_USAGE;
+    }
     const ttlMinutes = positiveNumber(flags.get('ttl-minutes'), DEFAULT_RESOLVE_TTL_MINUTES);
     if (ttlMinutes === null) {
       io.err('--ttl-minutes must be a positive number');
       return EXIT_USAGE;
     }
     if (flags.has('min-age-minutes')) {
-      io.err('--min-age-minutes is fixed at 10 minutes and cannot be lowered; elapsed time is not proof that a request completed');
+      io.err('--min-age-minutes cannot be lowered: the age floor is max(10 minutes, 2x BRAIN_TIMEOUT_MS + 1s); elapsed time is not proof that a request completed');
       return EXIT_USAGE;
     }
     const note = typeof flags.get('note') === 'string' ? (flags.get('note') as string) : undefined;
 
+    const acknowledgeLegacy = flags.get('acknowledge-legacy-budget') === true;
+    const LEGACY_WARNING =
+      'This entry has no recorded in-flight budget (written by an older Hub). The age floor uses THIS shell\'s BRAIN_TIMEOUT_MS; it must equal the value the Hub ran with. Re-run with --acknowledge-legacy-budget once you have verified that.';
+
     if (flags.get('yes') !== true) {
-      io.out(`Dry run only: no state changed. The store will validate that ${prefix} identifies exactly one UNKNOWN entry when applied.`);
+      const preview = store.inspectUnknown(prefix, { minAgeMs: minResolveAgeMs(), now });
+      io.out('Dry run only: no state changed.');
+      if (preview.ok) {
+        io.out(`Matched ${preview.hashPrefix}, quarantined ${age(preview.unknownSince, now)} ago; eligible for resolution.`);
+        if (!preview.budgetKnown) io.out(`WARNING: ${LEGACY_WARNING}`);
+      } else {
+        io.out(`This would be REFUSED: ${REFUSAL_TEXT[preview.reason]}`);
+      }
       io.out(
         outcome === 'not_stored'
           ? 'NOT_STORED makes this content claimable again: a retry will write it. Confirm in the backend that no entry with this contentHash exists first.'
@@ -183,35 +253,35 @@ export function runCli(argv: string[], options: CliOptions = {}): number {
       return EXIT_CONFIRM;
     }
 
+    if (!acknowledgeLegacy) {
+      const pre = store.inspectUnknown(prefix, { minAgeMs: minResolveAgeMs(), now });
+      if (pre.ok && !pre.budgetKnown) {
+        io.err(`Refused: ${LEGACY_WARNING}`);
+        return EXIT_REFUSED;
+      }
+    }
+
     const operator = options.operator ?? userInfo().username;
     const result = store.resolveUnknown(prefix, {
       outcome: outcome as UnknownOutcome,
       operator,
-      minAgeMs: DEFAULT_MIN_AGE_MINUTES * 60_000,
+      minAgeMs: minResolveAgeMs(),
       ttlMinutes,
       note,
       now,
     });
     if (!result.ok) {
-      const why: Record<string, string> = {
-        invalid_prefix: 'The hash prefix must be 8-64 hexadecimal characters.',
-        not_found: 'No UNKNOWN entry matches that prefix (it may already be resolved).',
-        ambiguous: 'More than one UNKNOWN entry matches; use a longer prefix.',
-        too_recent: `The entry was quarantined less than ${DEFAULT_MIN_AGE_MINUTES} minutes ago; a request may still be in flight.`,
-        missing_timestamp: 'The UNKNOWN entry has no quarantine timestamp; refusing to resolve corrupted or legacy state.',
-      };
-      io.err(`Refused: ${why[result.reason]}`);
+      io.err(`Refused: ${REFUSAL_TEXT[result.reason]}`);
       return EXIT_REFUSED;
     }
-    io.out(`Resolved ${result.hashPrefix} as ${result.outcome} (recorded for audit as ${operator}).`);
+    io.out(`Resolved ${result.hashPrefix} as ${result.outcome} (recorded for audit as ${sanitizeForDisplay(operator)}).`);
     return EXIT_OK;
   } finally {
     if (ownsStore && store) store.close();
   }
 }
 
-const invokedDirectly = process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
-if (invokedDirectly) {
+if (isEntrypoint(import.meta.url, process.argv[1])) {
   try {
     process.exitCode = runCli(process.argv.slice(2));
   } catch (error) {

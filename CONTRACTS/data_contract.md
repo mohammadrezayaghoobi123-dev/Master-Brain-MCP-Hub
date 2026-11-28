@@ -1,11 +1,10 @@
 # Data Contract — Memory Domain
 
-> **REGEL:** Keine stillen Änderungen an Typen/Feldern.
-> Vertragsänderungen benötigen eine explizite Projektfreigabe. Diese Revision wurde durch die ausdrückliche Projektowner-Anweisung vom 2026-11-28 autorisiert.
+> **RULE:** No silent changes to types or fields.
+> Changes require: `CHANGE AUTHORIZED: ...`
 
-**Version:** 1.2.0  
-**Letzte Änderung:** 2026-11-28  
-**Scope:** Memory-Domain und lokale Dedup-Persistenz des MCP Hub. Dieser Vertrag beschreibt NICHT das SQLite-/Backend-Speicherschema des externen Brain-Dienstes.
+**Version:** 1.4.0  
+**Last updated:** 2026-11-28
 
 ---
 
@@ -21,20 +20,20 @@ Canonical source: `src/types/index.ts` → `MEMORY_TYPES`.
 
 ## BrainEntry
 
-| Feld | Typ | Pflicht | Notes |
+| Field | Type | Required | Notes |
 |------|-----|---------|-------|
 | id | string (UUID) | yes (server) | assigned by backend |
 | type | MemoryType | yes | |
 | content | string ≤ 10000 | yes | |
 | summary | string ≤ 200 | no | |
-| tags | string[] 1–10 | yes | lowercase preferred; entries must be non-empty strings |
+| tags | string[] 1–10 | yes | lowercase preferred; every tag must be non-empty after trimming |
 | source | MemorySource | yes | |
 | timestamp | ISO-8601 string | yes (server) | never a Date object on the wire |
-| metadata | object | no | free-form; Auto-Memory stores confidence, contentHash |
+| metadata | object | no | free-form; Auto-Memory stores confidence and contentHash |
 
 ## MemorySource
 
-| Feld | Typ | Pflicht |
+| Field | Type | Required |
 |------|-----|---------|
 | tool | claude-code \| codex \| cursor \| api \| manual \| auto-memory | yes |
 | session_id | string | no |
@@ -42,24 +41,13 @@ Canonical source: `src/types/index.ts` → `MEMORY_TYPES`.
 | file | string | no |
 | user_id | string | no |
 
-The table above is the canonical field-level domain shape referenced by `CONTRACTS/api_contract.md`. It is a repository contract; conformance of a deployed external Backend remains a separate runtime verification requirement.
-
 ---
 
 ## Local dedup store (MCP Hub only)
 
-The local deduplication database is not the Brain database. It coordinates Auto-Memory writes only among Hub processes that share the same SQLite file.
+SQLite is the durable, cross-process deduplication backend. In production, SQLite is required; the in-process memory backend is non-durable and is intended only for tests or an explicitly configured non-production use. All Hub processes that must coordinate duplicate auto-saves must use the same SQLite database file.
 
-SQLite path selection:
-- `DEDUP_DB_PATH`: explicit database-file path.
-- `DATA_DIR`: database path is `$DATA_DIR/.data/auto-memory-dedup.sqlite`.
-- Outside production, absent configuration falls back to `.data/auto-memory-dedup.sqlite` under the current working directory.
-- In production, an explicit absolute `DEDUP_DB_PATH` or absolute `DATA_DIR` is mandatory. CWD-dependent paths are rejected.
-- Production and `DEDUP_REQUIRE_SQLITE=1|true` fail closed if SQLite is unavailable. An in-memory fallback has no restart persistence and no cross-process coordination.
-
-### Final SQLite schema
-
-The constructor creates the base table and applies additive columns/indexes inside one `BEGIN IMMEDIATE` / `COMMIT` migration. Legacy rows receive `state='committed'` through the column default. On migration failure it attempts `ROLLBACK`, closes the native handle, and rethrows the original failure.
+The following describes the **current logical schema after additive migrations** (not a requirement that every column be present in the initial CREATE TABLE statement):
 
 ```sql
 CREATE TABLE content_hashes (
@@ -67,7 +55,8 @@ CREATE TABLE content_hashes (
   expires_at INTEGER NOT NULL,
   state TEXT NOT NULL DEFAULT 'committed', -- pending | unknown | committed
   owner TEXT,
-  unknown_since INTEGER
+  unknown_since INTEGER,
+  resolve_not_before INTEGER
 );
 
 CREATE INDEX idx_hashes_expires
@@ -86,44 +75,71 @@ CREATE TABLE unknown_resolutions (
 );
 ```
 
-### Dedup state machine
+The database path is configured explicitly (production requires a persistent SQLite path); the conventional location is `$DATA_DIR/.data/auto-memory-dedup.sqlite`.
+This contract covers the Hub-local deduplication store only; it does not specify the external Brain Backend's internal storage schema or prove deployed-backend conformance.
 
-```
-free --claim--> pending --markUnknown--> unknown --commit--> committed
-                    |                       |
-                    | lease expires         | operator resolution:
-                    v                       | not_stored -> delete row
-                   free                     | stored -> committed
-                                            |
-                                            +-- never expires automatically
-```
+SQLite path selection:
+- `DEDUP_DB_PATH`: explicit database-file path.
+- `DATA_DIR`: database path is `$DATA_DIR/.data/auto-memory-dedup.sqlite`.
+- Outside production, absent configuration may use `.data/auto-memory-dedup.sqlite` under the current working directory.
+- In production, an absolute persistent path is mandatory; CWD-dependent paths are rejected.
+- Production and `DEDUP_REQUIRE_SQLITE=1|true` fail closed if SQLite is unavailable. In-memory fallback is non-durable and has no cross-process coordination.
 
-- `pending`: pre-dispatch reservation owned by one interaction. It is time-bounded by the effective lease. The same owner must successfully transition it to `unknown` before the external Brain POST is dispatched.
-- `unknown`: the request may have been dispatched and its persistence outcome cannot be proven. It is quarantined, does not expire, is excluded from expiry purge, and blocks automatic retry. Its owner identity is retained for matching-owner transitions.
-- `committed`: the Brain save has been positively confirmed by the Hub's response contract. The owner is cleared and the row is retained for the configured deduplication TTL.
-- A `pending` row can expire before dispatch; it then becomes claimable. An `unknown` row never becomes claimable by elapsed time alone.
-- `release` deletes only a matching owner's `pending` row. It cannot release `unknown` or `committed`.
-- `revertUnknown` deletes only the matching owner's `unknown` row and is reserved for transport failures classified as definitely pre-dispatch. Timeouts, resets, HTTP errors, redirects, and malformed/unreadable success responses remain quarantined.
-- `commit` changes only a matching owner's `unknown` row to `committed`. A stale owner cannot overwrite a successor claim.
-- `add` may add a committed marker only when the key is free or an existing non-UNKNOWN row has expired. It cannot replace live `pending` or any `unknown` row.
-- `status` is read-only: it returns `null` for an expired non-UNKNOWN row without performing a global purge write. `purgeExpired` removes expired non-UNKNOWN rows only.
+### Migration and SQLite contention policy
 
-### Operator reconciliation and audit
+- Additive schema and index migrations run inside one `BEGIN IMMEDIATE` / `COMMIT` transaction. If any DDL step fails, the migration attempts `ROLLBACK`, closes the native SQLite handle, and rethrows the original error; partial schema upgrades are not accepted.
+- The production `better-sqlite3` busy timeout is bounded at **100 ms** to avoid a multi-second synchronous event-loop stall. `SQLITE_BUSY` is surfaced as an operation failure; the Hub fails closed and does not dispatch a Brain POST unless the pending-to-UNKNOWN transition has been confirmed.
+- A lock timeout is not evidence that an external Brain write was absent. Dispatched or otherwise ambiguous writes remain in UNKNOWN; no automatic retry or exactly-once claim follows from the local SQLite state machine.
 
-- Reconciliation is operator-only through the CLI; it is not exposed as an MCP tool.
-- An operator identifies an UNKNOWN row using a unique hexadecimal hash prefix (8–64 characters). Multiple matches fail as ambiguous; the resolution also enforces a configured minimum age.
-- `not_stored` deletes the matching UNKNOWN row, reopening the content for a future claim. `stored` converts it to `committed` for the selected TTL.
-- The state change and corresponding `unknown_resolutions` insert occur in one `BEGIN IMMEDIATE` transaction. A failed transaction rolls back both.
-- The audit row records timestamp, 12-character hash prefix, outcome, normalized operator, and optional normalized note. The implementation does not provide cryptographic tamper evidence, external anchoring, or protection against an actor with direct database write access. Those controls require a separate trusted system.
-- Owner tokens and full content hashes are never included in safe operational summaries or CLI listing output.
+This contract covers the Hub-local deduplication store only; it does not specify the external Brain Backend's internal storage schema or prove deployed-backend conformance.
 
-This local store does **not** guarantee exactly-once writes to the external Brain Backend. Runtime Backend support for `Idempotency-Key`, endpoint identity, and durability must be verified independently.
+SQLite path selection:
+- `DEDUP_DB_PATH`: explicit database-file path.
+- `DATA_DIR`: database path is `$DATA_DIR/.data/auto-memory-dedup.sqlite`.
+- Outside production, absent configuration may use `.data/auto-memory-dedup.sqlite` under the current working directory.
+- In production, an absolute persistent path is mandatory; CWD-dependent paths are rejected.
+- Production and `DEDUP_REQUIRE_SQLITE=1|true` fail closed if SQLite is unavailable. In-memory fallback is non-durable and has no cross-process coordination.
+
+
+### State semantics and invariants
+
+- **`pending`**: a time-bounded reservation created by `claim`, owned by one in-flight interaction. Its `expires_at` is the lease deadline. Only the matching owner may release it.
+- **`unknown`**: a durable quarantine entered before dispatching a Brain write. `markUnknown(hash, owner, inFlightBudgetMs?)` requires the matching owner and a still-valid pending lease. The third argument remains optional for rolling-upgrade compatibility with older Hub writers; new middleware code supplies it. For new middleware writes, `inFlightBudgetMs` is `2 × BRAIN_TIMEOUT_MS + 1 second`; the store persists the resulting absolute deadline in `resolve_not_before`. The state does not expire: its timestamp is recorded in `unknown_since`, and the implementation stores a non-expiring sentinel in `expires_at`. A claim or ordinary add must never replace an UNKNOWN row.
+- **`committed`**: a Brain save was positively acknowledged, or an operator explicitly resolved an UNKNOWN entry as `stored`. Its `expires_at` is the deduplication-window deadline; after that deadline it may be claimed again.
+- Existing rows from earlier schemas are migrated additively; new nullable columns are added without discarding existing hash/expiry data. Legacy UNKNOWN rows have `resolve_not_before = NULL`; this can result either from an older schema or from an older Hub writer that still uses the backward-compatible two-argument `markUnknown(hash, owner)` call during a rolling upgrade. NULL means the per-entry in-flight budget is unknown, not that the request is safe to resolve.
+- Expired non-UNKNOWN rows are logically absent to status checks and may be atomically replaced by a new claim. Physical cleanup is performed by the expiry purge path.
+
+### Owner-checked transitions
+
+- **`pending → unknown`**: only `markUnknown(hash, owner, inFlightBudgetMs?)` may perform this transition, and only while that owner's lease remains valid. The current middleware implementation supplies the per-entry in-flight budget before dispatching the external Brain write; older mixed-version writers may omit it and therefore create a legacy NULL-budget row.
+- **`pending → absent`**: `release(hash, owner)` deletes only the matching owner's PENDING row.
+- **`unknown → absent`**: `revertUnknown(hash, owner)` is allowed only for the matching owner when the request is positively known to have **not** been dispatched. This is not a general retry mechanism.
+- **`unknown → committed`**: `commit(hash, owner, ttl)` updates only the matching owner's UNKNOWN row. A stale owner cannot commit or overwrite another owner's reservation.
+- **`unknown → absent` or `unknown → committed`** may also be performed by the operator-only resolution workflow, after out-of-band verification, using a unique hash prefix. The resolution and its audit row are written in one immediate SQLite transaction.
+- An UNKNOWN row blocks automatic re-claim indefinitely until one of those explicit, owner-checked or operator-mediated resolution paths succeeds. Lease expiry alone is never evidence that the external write did not happen.
+
+### Operator resolution and audit
+
+The operator CLI supports listing quarantined rows, resolving one uniquely identified UNKNOWN row as `not_stored` or `stored`, and listing resolution history. It is a local CLI operation, **not an MCP tool**.
+
+- Resolution is guarded by both the minimum-age rule and, for rows with a recorded budget, the per-entry `resolve_not_before` deadline. The CLI minimum age is `max(10 minutes, 2 × BRAIN_TIMEOUT_MS + 1 second)`. A row is refused while its per-entry deadline has not elapsed (`in_flight`), even if the minimum-age rule is already satisfied.
+- These deadlines are delays, **not proof** that an in-flight request completed. The backend may continue processing after the client aborts or crashes. The operator must establish the external outcome out of band before selecting either outcome.
+- For legacy UNKNOWN rows with no recorded per-entry budget, the dry run warns that the budget is unknown. Applying a resolution requires explicit `--acknowledge-legacy-budget`; the operator must verify that the CLI's `BRAIN_TIMEOUT_MS` matches the value used by the Hub that wrote the row.
+- Resolving as `stored` requires an explicit positive `--ttl-minutes` value. The CLI checks that the value is present and positive, but does not compare it with the running Hub's configured deduplication window; the operator must verify and supply the matching value out of band. An incorrect value can shorten or extend duplicate protection.
+- The CLI prints the database path it uses, requires SQLite, and refuses to create a missing, empty, or directory database path. Opening an existing database may apply additive schema migrations.
+- A dry run (without `--yes`) previews the uniquely matched row and its eligibility without changing state. The actual resolution rechecks eligibility inside the store's transaction.
+
+The `unknown_resolutions` table records timestamp, hash prefix, outcome, operator identity, and optional note. The application writes resolution and audit record atomically. This is an application-level append-only audit trail; it is **not tamper-proof** against direct database modification or host compromise.
+
+This store is **not** the Brain database; it coordinates duplicate auto-saves only among Hub processes that share the same SQLite file. It does not provide exactly-once delivery, and it cannot independently establish whether an ambiguous external request was persisted. Backend `Idempotency-Key` semantics remain unverified unless separately established by backend evidence.
 
 ---
 
 ## Changelog
 
-| Datum | Änderung | Genehmigt von |
+| Date | Change | Authorized by |
 |-------|----------|---------------|
 | 2026-11-08 | Defined real memory domain; added local dedup table | engineering |
-| 2026-11-28 | Corrected local dedup schema, three-state lifecycle, owner rules, transactional operator resolution, and external-audit limitations | project owner (explicit authorization) |
+| 2026-11-14 | Aligned dedup schema, UNKNOWN quarantine, owner-checked transitions, operator resolution, and audit semantics with PR17 | explicit user authorization |
+| 2026-11-23 | Aligned schema and operator-resolution contract with PR20, including per-entry in-flight deadlines and legacy-row handling | explicit user authorization |
+| 2026-11-28 | Reconciled BrainEntry tag requirements, migration atomicity, bounded SQLite contention, and the P11 operator safeguards with the integrated Hub implementation | project owner (whole-project integration instruction) |
