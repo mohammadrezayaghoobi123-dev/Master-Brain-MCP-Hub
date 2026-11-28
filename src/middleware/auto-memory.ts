@@ -28,6 +28,9 @@ const analysisSchema = z.object({
   context: z.string().max(500).optional(),
 });
 
+/** Hard floor: model may claim importance, but below this we reject. */
+const CONFIDENCE_HARD_FLOOR = 0.75;
+
 const DEFAULT_CONFIG: AutoMemoryConfig = {
   enabled: true,
   minConfidence: 0.7,
@@ -104,7 +107,9 @@ export class AutoMemoryMiddleware {
       );
     }
 
-    if (!analysis.isImportant || analysis.confidence < this.config.minConfidence) {
+    // Dual gate: model flag AND confidence (config + hard floor)
+    const effectiveMin = Math.max(this.config.minConfidence, CONFIDENCE_HARD_FLOOR);
+    if (!analysis.isImportant || analysis.confidence < effectiveMin) {
       return { saved: false, reason: 'below_threshold', entry: analysis };
     }
 
@@ -133,47 +138,100 @@ export class AutoMemoryMiddleware {
   }
 
   private async analyzeImportance(request: string, response: string): Promise<AnalysisResult> {
-    const prompt = `Analysiere diese AI-Interaktion und bestimme ob sie fuer langfristiges Wissen gespeichert werden sollte.\n\nREQUEST:\n${request.substring(0, 2000)}\n\nRESPONSE:\n${response.substring(0, 3000)}\n\nAntworte NUR mit validem JSON in diesem Format:\n{\n  "isImportant": boolean,\n  "type": "decision" | "fix" | "learning" | "pattern" | "preference" | "config" | "error" | "context" | "conversation",\n  "summary": "Kurze Zusammenfassung (max 200 Zeichen)",\n  "tags": ["tag1", "tag2", "tag3"],\n  "confidence": 0.0-1.0,\n  "context": "Optional: Warum ist das wichtig?"\n}\n\nRegeln:\n- isImportant=true NUR wenn: Entscheidung, Bug-Fix, Learning, Pattern, Preference, Config\n- isImportant=false fuer Smalltalk und einfache Fragen\n- confidence: 0.9+ sehr wichtig, 0.7-0.9 wichtig, <0.7 nicht speichern\n- tags: max 5, lowercase`;
+    const prompt = `You are a strict, high-precision Memory Importance Classifier for an engineering knowledge system (Master Brain).
+
+Single task: decide whether the interaction contains durable, reusable knowledge worth long-term storage. Reject everything else.
+
+### Durable Knowledge (ONLY these qualify as isImportant=true)
+- Explicit decision that constrains future work
+- Root-cause analysis + concrete fix
+- Generalizable learning or principle
+- Reusable pattern or anti-pattern
+- Stable user/project preference
+- Material configuration or architectural choice
+- Actionable, non-transient error mode
+
+### Hard Rejection (must set isImportant=false)
+- Small talk, acknowledgments, status updates
+- One-off questions with no lasting value
+- Transient debugging noise without root cause
+- Pure speculation without conclusion
+- Trivial or already-obvious information
+- Anything you would assign confidence < 0.75
+
+### Output Rules (CRITICAL)
+- Respond with ONLY valid JSON. No markdown fences, no commentary, no extra text.
+- summary: max 180 characters, factual, no fluff
+- tags: 1-5 items, lowercase, specific, no spaces
+- confidence: calibrated probability in [0.0, 1.0]; be conservative
+- type must be one of: decision | fix | learning | pattern | preference | config | error | context | conversation
+
+### JSON shape
+{
+  "isImportant": boolean,
+  "type": "decision" | "fix" | "learning" | "pattern" | "preference" | "config" | "error" | "context" | "conversation",
+  "summary": "string",
+  "tags": ["string"],
+  "confidence": number,
+  "context": "string (optional, max 300 chars)"
+}
+
+### Interaction to classify
+
+REQUEST:
+${request.substring(0, 2200)}
+
+RESPONSE:
+${response.substring(0, 3200)}
+`;
 
     const message = await this.getAnthropic().messages.create({
       model: this.config.analysisModel,
-      max_tokens: 500,
+      max_tokens: 400,
       messages: [{ role: 'user', content: prompt }],
     });
 
     const block = message.content[0];
     if (!block || block.type !== 'text') {
-      return this.defaultResult();
+      return this.defaultResult('non_text_block');
     }
 
     const jsonMatch = block.text.match(/\{[\s\S]*\}/);
     if (!jsonMatch) {
-      return this.defaultResult();
+      return this.defaultResult('no_json');
     }
 
     let parsed: unknown;
     try {
       parsed = JSON.parse(jsonMatch[0]);
     } catch {
-      return this.defaultResult();
+      return this.defaultResult('json_parse_error');
     }
 
     const result = analysisSchema.safeParse(parsed);
     if (!result.success) {
-      return this.defaultResult();
+      return this.defaultResult('schema_validation_failed');
+    }
+
+    let isImportant = result.data.isImportant;
+    const confidence = result.data.confidence;
+
+    // Atomic post-condition: never trust model importance below hard floor
+    if (confidence < CONFIDENCE_HARD_FLOOR) {
+      isImportant = false;
     }
 
     return {
-      isImportant: result.data.isImportant,
+      isImportant,
       type: result.data.type as MemoryType,
-      summary: result.data.summary.substring(0, 200),
+      summary: result.data.summary.substring(0, 180),
       tags: result.data.tags.slice(0, 5).map((t) => t.toLowerCase().trim()),
-      confidence: result.data.confidence,
+      confidence,
       context: result.data.context,
     };
   }
 
-  private defaultResult(): AnalysisResult {
+  private defaultResult(_reason?: string): AnalysisResult {
     return {
       isImportant: false,
       type: 'context',
