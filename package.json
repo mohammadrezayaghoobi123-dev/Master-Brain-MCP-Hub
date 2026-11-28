@@ -11,7 +11,8 @@
     "test": "vitest",
     "test:run": "vitest run",
     "lint": "eslint src/",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "dedup:admin": "node dist/cli/dedup-admin.js"
   },
   "keywords": [
     "mcp",
