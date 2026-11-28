@@ -564,7 +564,7 @@ describe('pre-dispatch transport recovery', () => {
         json: async () => savedEntry,
       }) as unknown as typeof fetch;
 
-    const hash = contentHash('eai-again request\\n---\\nresponse');
+    const hash = contentHash('eai-again request\n---\nresponse');
     try {
       await expect(mw.processInteraction('eai-again request', 'response', { tool: 'manual' }))
         .rejects.toMatchObject({
