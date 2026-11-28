@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { AutoMemoryMiddleware } from '../src/middleware/auto-memory.js';
+import { AutoMemoryMiddleware, _internal } from '../src/middleware/auto-memory.js';
 import type { DedupStore } from '../src/lib/dedup-store.js';
 
 function memoryDedup(): DedupStore {
@@ -28,7 +28,7 @@ describe('AutoMemoryMiddleware', () => {
 
   beforeEach(() => {
     mw = new AutoMemoryMiddleware(
-      { enabled: true, minConfidence: 0.7, maxEntriesPerSession: 2 },
+      { enabled: true, minConfidence: 0.75, maxEntriesPerSession: 2 },
       memoryDedup()
     );
   });
@@ -49,6 +49,36 @@ describe('AutoMemoryMiddleware', () => {
     expect(mw.getStatus().config.minConfidence).toBe(1);
     mw.updateConfig({ minConfidence: -1 });
     expect(mw.getStatus().config.minConfidence).toBe(0);
+  });
+
+  it('status exposes hard floor and effective minimum', () => {
+    const s = mw.getStatus();
+    expect(s.confidenceHardFloor).toBe(_internal.CONFIDENCE_HARD_FLOOR);
+    expect(s.effectiveMinConfidence).toBe(
+      Math.max(s.config.minConfidence, _internal.CONFIDENCE_HARD_FLOOR)
+    );
+  });
+
+  it('effectiveMinConfidence never below hard floor', () => {
+    mw.updateConfig({ minConfidence: 0.1 });
+    expect(mw.effectiveMinConfidence()).toBe(_internal.CONFIDENCE_HARD_FLOOR);
+    mw.updateConfig({ minConfidence: 0.95 });
+    expect(mw.effectiveMinConfidence()).toBe(0.95);
+  });
+});
+
+describe('normalizeTags', () => {
+  it('lowercases, hyphenates, dedupes, strips junk', () => {
+    expect(_internal.normalizeTags(['  Foo Bar ', 'foo-bar', 'OK!', '', 'x'.repeat(100)])).toEqual([
+      'foo-bar',
+      'ok',
+      'x'.repeat(64),
+    ]);
+  });
+
+  it('returns empty for unusable input', () => {
+    expect(_internal.normalizeTags([])).toEqual([]);
+    expect(_internal.normalizeTags(['???', '   '])).toEqual([]);
   });
 });
 
